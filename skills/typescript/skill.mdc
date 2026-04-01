@@ -1,0 +1,403 @@
+---
+description: Expert TypeScript and JavaScript conventions for any project. Covers type system best practices, async patterns, error handling, module architecture, ESLint/Prettier setup, branded types, and code quality rules. This is a foundational skill — always apply it to any TypeScript or JavaScript file as a baseline layer alongside more specific framework skills.
+globs: []
+alwaysApply: true
+---
+
+# TypeScript / JavaScript — Expert Foundational Skill
+
+Expert TypeScript and modern JavaScript conventions. Apply to all TS/JS work across any framework.
+
+---
+
+## TypeScript Configuration
+
+### Strict tsconfig.json
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+```
+
+> **Caveats:**
+> - `noUncheckedIndexedAccess` can break some third-party library typings — enable and fix errors rather than disabling
+> - `moduleResolution: "bundler"` requires a bundler (Next.js, Vite, etc.) — for pure Node.js scripts use `"node16"` or `"nodenext"` instead
+> - `exactOptionalPropertyTypes` is stricter than most libraries expect — may require `// @ts-expect-error` on some external types
+
+---
+
+## ESLint & Prettier
+
+```bash
+npm install -D eslint @typescript-eslint/parser @typescript-eslint/eslint-plugin eslint-config-prettier prettier
+```
+
+```javascript
+// eslint.config.js (flat config — ESLint 9+)
+import tseslint from '@typescript-eslint/eslint-plugin';
+import tsParser from '@typescript-eslint/parser';
+
+export default [
+  {
+    files: ['**/*.{ts,tsx}'],
+    languageOptions: { parser: tsParser },
+    plugins: { '@typescript-eslint': tseslint },
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'error',
+      '@typescript-eslint/no-floating-promises': 'error',      // catches unawaited promises
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+      '@typescript-eslint/consistent-type-imports': 'error',   // enforces `import type`
+      '@typescript-eslint/no-unnecessary-condition': 'warn',
+      'no-console': ['warn', { allow: ['warn', 'error'] }],
+    },
+  },
+];
+```
+
+```json
+// .prettierrc
+{
+  "semi": true,
+  "singleQuote": true,
+  "tabWidth": 2,
+  "trailingComma": "all",
+  "printWidth": 100,
+  "plugins": ["prettier-plugin-tailwindcss"]
+}
+```
+
+```json
+// package.json scripts
+{
+  "scripts": {
+    "lint": "eslint . --max-warnings 0",
+    "format": "prettier --write .",
+    "type-check": "tsc --noEmit"
+  }
+}
+```
+
+---
+
+## Type System Discipline
+
+### Prefer Explicit Types
+```typescript
+// BAD — inferred any, loose
+function process(data: any) { return data.result; }
+
+// GOOD — explicit, safe
+function process(data: { result: string }): string {
+  return data.result;
+}
+
+// Use unknown instead of any for truly unknown values
+function parseInput(raw: unknown): string {
+  if (typeof raw !== 'string') throw new TypeError('Expected string');
+  return raw;
+}
+```
+
+### Discriminated Unions (prefer over nullable types)
+```typescript
+// BAD
+interface ApiResponse {
+  data?: Post;
+  error?: string;
+}
+
+// GOOD — exhaustive, compiler-enforced
+type ApiResult<T> =
+  | { status: 'success'; data: T }
+  | { status: 'error'; error: string; code: number }
+  | { status: 'loading' };
+
+function render(result: ApiResult<Post>) {
+  switch (result.status) {
+    case 'success': return result.data.title;       // data is typed
+    case 'error':   return result.error;             // error is typed
+    case 'loading': return 'Loading...';
+    // Compiler warns if you add a new case and forget it here
+  }
+}
+```
+
+### Utility Types — Know These
+```typescript
+type PartialPost  = Partial<Post>;               // all optional
+type RequiredPost = Required<Post>;              // all required
+type PostTitle    = Pick<Post, 'title' | 'slug'>; // subset
+type PostNoId     = Omit<Post, 'id'>;            // exclude
+type ReadPost     = Readonly<Post>;              // immutable
+type PostRecord   = Record<string, Post>;        // dict
+type PostKeys     = keyof Post;                  // union of keys
+type PostId       = Post['id'];                  // indexed access
+```
+
+### Branded Types — Prevent ID Mix-ups
+```typescript
+// Branded (nominal) types make type-incompatible what TypeScript treats as equivalent
+type Brand<T, B extends string> = T & { readonly __brand: B };
+
+type UserId  = Brand<string, 'UserId'>;
+type PostId  = Brand<string, 'PostId'>;
+type OrderId = Brand<string, 'OrderId'>;
+
+// Constructor functions — the only way to create a branded value
+function userId(id: string):  UserId  { return id as UserId; }
+function postId(id: string):  PostId  { return id as PostId; }
+function orderId(id: string): OrderId { return id as OrderId; }
+
+// Now these are type errors — catches entire class of bugs
+function getPost(id: PostId) { /* ... */ }
+const uid = userId('abc-123');
+getPost(uid); // TypeScript error: UserId is not assignable to PostId ✓
+```
+
+### Satisfies Operator (TypeScript 4.9+)
+```typescript
+// Validates shape without widening the type
+const config = {
+  db: { host: 'localhost', port: 5432 },
+  api: { url: 'https://api.example.com' },
+} satisfies Record<string, Record<string, string | number>>;
+
+// config.db.port is still typed as number, not string | number
+```
+
+---
+
+## Async Patterns
+
+### Always Await, Always Catch
+```typescript
+// NEVER leave floating promises
+someAsyncFn(); // BAD — unhandled rejection
+
+// GOOD — await or explicitly handle
+await someAsyncFn();
+void someAsyncFn().catch(console.error); // if fire-and-forget is intentional
+
+// GOOD — typed async function
+async function fetchUser(id: string): Promise<User> {
+  const response = await fetch(`/api/users/${id}`);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: Failed to fetch user ${id}`);
+  }
+  return response.json() as Promise<User>;
+}
+```
+
+### Parallel Async — Prefer Promise.all
+```typescript
+// BAD — sequential (slow)
+const user  = await getUser(id);
+const posts = await getPosts(id);
+
+// GOOD — parallel
+const [user, posts] = await Promise.all([getUser(id), getPosts(id)]);
+
+// GOOD — parallel with individual error handling
+const results = await Promise.allSettled([getUser(id), getPosts(id)]);
+const [userResult, postsResult] = results;
+
+if (userResult.status === 'fulfilled') {
+  const user = userResult.value;
+}
+```
+
+### Result Pattern (avoids try/catch proliferation)
+```typescript
+type Result<T, E = Error> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+async function safeParseJson<T>(text: string): Promise<Result<T>> {
+  try {
+    return { ok: true, value: JSON.parse(text) as T };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err : new Error(String(err)) };
+  }
+}
+
+// Usage — no try/catch at call site
+const result = await safeParseJson<Post>(rawText);
+if (!result.ok) {
+  console.error('Parse failed:', result.error.message);
+  return;
+}
+const post = result.value; // typed as Post
+```
+
+---
+
+## Error Handling
+
+### Custom Error Classes
+```typescript
+class AppError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string,
+    public readonly statusCode: number = 500,
+    public readonly context?: Record<string, unknown>
+  ) {
+    super(message);
+    this.name = this.constructor.name;
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, this.constructor);
+    }
+  }
+}
+
+class NotFoundError extends AppError {
+  constructor(resource: string, id: string) {
+    super(`${resource} not found: ${id}`, 'NOT_FOUND', 404, { resource, id });
+  }
+}
+
+class ValidationError extends AppError {
+  constructor(message: string, public readonly fields: Record<string, string[]>) {
+    super(message, 'VALIDATION_ERROR', 422);
+  }
+}
+
+// Usage
+throw new NotFoundError('Post', postId);
+
+// Type narrowing
+if (err instanceof NotFoundError) {
+  return res.status(404).json({ error: err.message });
+}
+```
+
+---
+
+## Module Architecture
+
+### Barrel Exports (with caution)
+```typescript
+// components/ui/index.ts — barrel for public API
+export { Button } from './Button';
+export { Input } from './Input';
+export { Card } from './Card';
+export type { ButtonProps } from './Button';
+
+// Import from barrel in consuming code
+import { Button, Card } from '@/components/ui';
+
+// CAUTION: barrels can cause circular dependencies — never barrel internals
+```
+
+### Module Cohesion
+```typescript
+// Keep related code together — feature folders, not type folders
+// BAD: /types/post.ts, /utils/post.ts, /hooks/post.ts, /components/Post.tsx
+// GOOD: /features/posts/types.ts, /features/posts/hooks.ts, /features/posts/Post.tsx
+```
+
+---
+
+## Functional Utilities
+
+### Type-Safe Object Utilities
+```typescript
+// Type-safe Object.keys/entries/fromEntries
+function objectKeys<T extends object>(obj: T): (keyof T)[] {
+  return Object.keys(obj) as (keyof T)[];
+}
+
+function objectEntries<T extends object>(obj: T): [keyof T, T[keyof T]][] {
+  return Object.entries(obj) as [keyof T, T[keyof T]][];
+}
+
+// Deep partial
+type DeepPartial<T> = T extends object
+  ? { [P in keyof T]?: DeepPartial<T[P]> }
+  : T;
+
+// Non-nullable
+type NonNullableFields<T> = { [K in keyof T]-?: NonNullable<T[K]> };
+```
+
+### Immutable Update Helpers
+```typescript
+// Use structuredClone for deep copies (Node 17+, modern browsers)
+const clone = structuredClone(original);
+
+// Prefer spreading for immutable updates
+const updated = { ...post, title: newTitle, updatedAt: new Date() };
+const withItem = [...items, newItem];
+const withoutItem = items.filter(item => item.id !== idToRemove);
+```
+
+---
+
+## Code Quality Rules
+
+### Naming
+- `camelCase` for variables, functions, methods
+- `PascalCase` for classes, interfaces, types, enums, React components
+- `SCREAMING_SNAKE_CASE` for true constants / env variable names
+- `kebab-case` for file names (except React components: `Button.tsx`)
+- Prefix booleans: `is`, `has`, `can`, `should` (`isLoading`, `hasError`)
+- Prefix handlers: `handle` for event callbacks (`handleClick`, `handleSubmit`)
+
+### Function Design
+```typescript
+// Max 3 parameters — beyond that, use an options object
+function createPost(title: string, content: string, options: CreatePostOptions): Post { ... }
+
+// Default parameter values, not undefined checks inside
+function paginate(page = 1, perPage = 15) { ... }
+
+// Pure functions where possible — same inputs → same outputs, no side effects
+function formatDate(date: Date, locale = 'en-US'): string {
+  return new Intl.DateTimeFormat(locale).format(date);
+}
+```
+
+### Imports Order (enforced by ESLint/Prettier)
+```typescript
+// 1. Node built-ins
+import { readFile } from 'fs/promises';
+
+// 2. External packages
+import { z } from 'zod';
+import type { NextRequest } from 'next/server';
+
+// 3. Internal absolute imports
+import { Button } from '@/components/ui';
+import { getPosts } from '@/lib/data/posts';
+
+// 4. Relative imports
+import { formatDate } from '../utils';
+import type { PostProps } from './types';
+```
+
+---
+
+## Rules
+
+- **Strict mode always** — never disable strict TypeScript
+- **No `any`** — use `unknown` + narrowing, or proper types
+- **No floating promises** — always `await` or explicitly handle
+- **Discriminated unions** over optional nullable properties
+- **Pure functions** for utilities and data transforms
+- **Named exports** preferred over default exports (except framework conventions: Next.js pages, React components)
+- **Immutable by default** — `const` everywhere, spread for updates
+- **Early returns** to reduce nesting — fail fast, return early

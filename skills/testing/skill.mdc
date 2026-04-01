@@ -1,0 +1,534 @@
+---
+description: Expert guidance for writing tests across the full stack. Covers Vitest + React Testing Library for unit/integration tests, Playwright for E2E, PHPUnit for Laravel, and test architecture patterns. Use when writing, fixing, or reviewing any test file, setting up test infrastructure, or deciding what and how to test.
+globs:
+  - "**/*.test.{ts,tsx,js}"
+  - "**/*.spec.{ts,tsx,js,php}"
+  - "**/tests/**/*.{ts,tsx,js,php}"
+  - "**/e2e/**/*.{ts,js}"
+  - "vitest.config.*"
+  - "playwright.config.*"
+  - "phpunit.xml"
+alwaysApply: false
+---
+
+# Testing — Expert Skill
+
+You are a senior engineer who treats tests as first-class code. Tests are not an afterthought — they are the specification. Apply these patterns rigorously across all test types.
+
+---
+
+## Core Philosophy
+
+- **Test behaviour, not implementation** — tests should survive a refactor that doesn't change what the code does
+- **Arrange, Act, Assert** — every test has exactly these three sections, clearly separated
+- **One assertion concept per test** — multiple `expect()` calls are fine if they all verify the same behaviour
+- **Tests are documentation** — a failing test should tell you exactly what broke and why, without reading the source
+
+---
+
+## Vitest — Unit & Integration
+
+### Setup
+```typescript
+// vitest.config.ts
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+import tsconfigPaths from 'vite-tsconfig-paths';
+
+export default defineConfig({
+  plugins: [react(), tsconfigPaths()],
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./tests/setup.ts'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'lcov'],
+      thresholds: {
+        lines: 80,
+        functions: 80,
+        branches: 75,
+        statements: 80,
+      },
+      exclude: ['**/*.config.*', '**/types/**', '**/migrations/**'],
+    },
+  },
+});
+```
+
+```typescript
+// tests/setup.ts
+import '@testing-library/jest-dom';
+import { cleanup } from '@testing-library/react';
+import { afterEach, vi } from 'vitest';
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+```
+
+### Pure Function Tests
+```typescript
+// lib/utils/format.test.ts
+import { describe, it, expect } from 'vitest';
+import { formatCurrency, formatDate, slugify } from './format';
+
+describe('formatCurrency', () => {
+  it('formats positive amounts with symbol', () => {
+    expect(formatCurrency(1234.56, 'USD')).toBe('$1,234.56');
+  });
+
+  it('formats zero as $0.00', () => {
+    expect(formatCurrency(0, 'USD')).toBe('$0.00');
+  });
+
+  it('throws on negative amounts', () => {
+    expect(() => formatCurrency(-1, 'USD')).toThrow('Amount must be non-negative');
+  });
+});
+
+describe('slugify', () => {
+  it.each([
+    ['Hello World',      'hello-world'],
+    ['Héllo Wörld',      'hello-world'],   // strips accents
+    ['  spaces  ',       'spaces'],
+    ['a--b',             'a-b'],           // collapses dashes
+  ])('slugify(%s) → %s', (input, expected) => {
+    expect(slugify(input)).toBe(expected);
+  });
+});
+```
+
+### Async & API Tests
+```typescript
+// lib/data/posts.test.ts
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { getPosts } from './posts';
+import { createSupabaseClient } from '@/lib/supabase/test-client';
+
+// Mock at the module level — not inside individual tests
+vi.mock('@/lib/supabase/client', () => ({
+  createClient: vi.fn(),
+}));
+
+describe('getPosts', () => {
+  const mockSupabase = {
+    from: vi.fn().mockReturnThis(),
+    select: vi.fn().mockReturnThis(),
+    eq: vi.fn().mockReturnThis(),
+    order: vi.fn().mockReturnThis(),
+    range: vi.fn(),
+  };
+
+  beforeEach(() => {
+    vi.mocked(createClient).mockReturnValue(mockSupabase as any);
+  });
+
+  it('returns published posts for a user', async () => {
+    mockSupabase.range.mockResolvedValue({
+      data: [{ id: '1', title: 'Test', published: true }],
+      error: null,
+    });
+
+    const posts = await getPosts('user-123');
+
+    expect(mockSupabase.from).toHaveBeenCalledWith('posts');
+    expect(mockSupabase.eq).toHaveBeenCalledWith('user_id', 'user-123');
+    expect(posts).toHaveLength(1);
+    expect(posts[0].title).toBe('Test');
+  });
+
+  it('throws on Supabase error', async () => {
+    mockSupabase.range.mockResolvedValue({
+      data: null,
+      error: { message: 'DB error' },
+    });
+
+    await expect(getPosts('user-123')).rejects.toThrow('DB error');
+  });
+});
+```
+
+---
+
+## React Testing Library
+
+### Component Test Scaffold
+```tsx
+// components/features/SearchBar.test.tsx
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { SearchBar } from './SearchBar';
+
+// Always use userEvent over fireEvent — it simulates real browser events
+const user = userEvent.setup();
+
+describe('SearchBar', () => {
+  it('renders with default placeholder', () => {
+    render(<SearchBar onSearch={vi.fn()} />);
+    expect(screen.getByRole('searchbox')).toHaveAttribute('placeholder', 'Search...');
+  });
+
+  it('calls onSearch with typed value after debounce', async () => {
+    const onSearch = vi.fn();
+    render(<SearchBar onSearch={onSearch} debounceMs={0} />);
+
+    await user.type(screen.getByRole('searchbox'), 'hello');
+
+    await waitFor(() => {
+      expect(onSearch).toHaveBeenCalledWith('hello');
+    });
+  });
+
+  it('clears input when clear button is clicked', async () => {
+    render(<SearchBar onSearch={vi.fn()} defaultValue="existing" />);
+    const input = screen.getByRole('searchbox');
+    expect(input).toHaveValue('existing');
+
+    await user.click(screen.getByRole('button', { name: /clear/i }));
+    expect(input).toHaveValue('');
+  });
+
+  it('shows loading indicator while searching', async () => {
+    render(<SearchBar onSearch={vi.fn()} isLoading />);
+    expect(screen.getByRole('status')).toBeInTheDocument(); // aria-role="status" on spinner
+  });
+});
+```
+
+### Custom Hook Tests
+```typescript
+// hooks/useCounter.test.ts
+import { renderHook, act } from '@testing-library/react';
+import { useCounter } from './useCounter';
+
+describe('useCounter', () => {
+  it('initialises with default value', () => {
+    const { result } = renderHook(() => useCounter());
+    expect(result.current.count).toBe(0);
+  });
+
+  it('increments count', () => {
+    const { result } = renderHook(() => useCounter(5));
+
+    act(() => { result.current.increment(); });
+
+    expect(result.current.count).toBe(6);
+  });
+
+  it('does not exceed max', () => {
+    const { result } = renderHook(() => useCounter(10, { max: 10 }));
+
+    act(() => { result.current.increment(); });
+
+    expect(result.current.count).toBe(10); // clamped
+  });
+});
+```
+
+### Server Action / Form Tests
+```typescript
+// lib/actions/posts.test.ts
+import { describe, it, expect, vi } from 'vitest';
+import { createPost } from './posts';
+
+vi.mock('@/lib/auth', () => ({
+  auth: vi.fn().mockResolvedValue({ user: { id: 'user-1' } }),
+}));
+
+vi.mock('@/lib/db', () => ({
+  db: { post: { create: vi.fn() } },
+}));
+
+describe('createPost action', () => {
+  function makeFormData(data: Record<string, string>) {
+    const fd = new FormData();
+    Object.entries(data).forEach(([k, v]) => fd.set(k, v));
+    return fd;
+  }
+
+  it('creates post and returns success state', async () => {
+    vi.mocked(db.post.create).mockResolvedValue({ id: 'post-1' });
+
+    const result = await createPost({}, makeFormData({
+      title: 'Test Post',
+      content: 'Long enough content here.',
+    }));
+
+    expect(result.errors).toBeUndefined();
+    expect(db.post.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ title: 'Test Post' }) })
+    );
+  });
+
+  it('returns validation errors for missing title', async () => {
+    const result = await createPost({}, makeFormData({ content: 'content' }));
+
+    expect(result.errors?.title).toBeDefined();
+    expect(db.post.create).not.toHaveBeenCalled();
+  });
+});
+```
+
+---
+
+## Playwright — E2E
+
+### Config
+```typescript
+// playwright.config.ts
+import { defineConfig, devices } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './e2e',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  workers: process.env.CI ? 1 : undefined,
+  reporter: [['html', { open: 'never' }], ['list']],
+  use: {
+    baseURL: process.env.E2E_BASE_URL ?? 'http://localhost:3000',
+    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+    video: 'on-first-retry',
+  },
+  projects: [
+    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+    { name: 'mobile',   use: { ...devices['iPhone 14'] } },
+  ],
+  webServer: {
+    command: 'npm run build && npm run start',
+    url: 'http://localhost:3000',
+    reuseExistingServer: !process.env.CI,
+  },
+});
+```
+
+### Page Object Model (always use for E2E)
+```typescript
+// e2e/pages/LoginPage.ts
+import { type Page, type Locator, expect } from '@playwright/test';
+
+export class LoginPage {
+  readonly page: Page;
+  readonly emailInput: Locator;
+  readonly passwordInput: Locator;
+  readonly submitButton: Locator;
+  readonly errorMessage: Locator;
+
+  constructor(page: Page) {
+    this.page = page;
+    // Use role/label selectors — never CSS class or data-testid by default
+    this.emailInput    = page.getByLabel('Email');
+    this.passwordInput = page.getByLabel('Password');
+    this.submitButton  = page.getByRole('button', { name: 'Sign in' });
+    this.errorMessage  = page.getByRole('alert');
+  }
+
+  async goto() {
+    await this.page.goto('/login');
+    await expect(this.submitButton).toBeVisible();
+  }
+
+  async login(email: string, password: string) {
+    await this.emailInput.fill(email);
+    await this.passwordInput.fill(password);
+    await this.submitButton.click();
+  }
+
+  async loginAs(role: 'admin' | 'user') {
+    const credentials = {
+      admin: { email: 'admin@test.com', password: process.env.E2E_ADMIN_PASS! },
+      user:  { email: 'user@test.com',  password: process.env.E2E_USER_PASS! },
+    };
+    await this.login(credentials[role].email, credentials[role].password);
+  }
+}
+```
+
+```typescript
+// e2e/auth.spec.ts
+import { test, expect } from '@playwright/test';
+import { LoginPage } from './pages/LoginPage';
+
+test.describe('Authentication', () => {
+  test('user can log in with valid credentials', async ({ page }) => {
+    const loginPage = new LoginPage(page);
+    await loginPage.goto();
+    await loginPage.loginAs('user');
+
+    await expect(page).toHaveURL('/dashboard');
+    await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible();
+  });
+
+  test('shows error on invalid credentials', async ({ page }) => {
+    const loginPage = new LoginPage(page);
+    await loginPage.goto();
+    await loginPage.login('bad@email.com', 'wrongpassword');
+
+    await expect(loginPage.errorMessage).toContainText('Invalid credentials');
+    await expect(page).toHaveURL('/login');
+  });
+
+  test('redirects unauthenticated user from dashboard', async ({ page }) => {
+    await page.goto('/dashboard');
+    await expect(page).toHaveURL('/login');
+  });
+});
+```
+
+### API Mocking in E2E
+```typescript
+// Intercept API calls — use for flaky third-party APIs or slow endpoints
+test('shows error when API is down', async ({ page }) => {
+  await page.route('**/api/posts', route => {
+    route.fulfill({ status: 503, body: JSON.stringify({ error: 'Service unavailable' }) });
+  });
+
+  await page.goto('/dashboard');
+  await expect(page.getByRole('alert')).toContainText('Something went wrong');
+});
+```
+
+---
+
+## PHPUnit — Laravel
+
+### Feature Test Scaffold
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Feature\Api;
+
+use App\Models\Post;
+use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Foundation\Testing\WithFaker;
+use Tests\TestCase;
+
+class PostApiTest extends TestCase
+{
+    use RefreshDatabase, WithFaker;
+
+    private User $user;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->user = User::factory()->create();
+    }
+
+    public function test_authenticated_user_can_create_post(): void
+    {
+        $response = $this->actingAs($this->user)
+            ->postJson('/api/v1/posts', [
+                'title'   => 'My Post Title',
+                'slug'    => 'my-post-title',
+                'content' => str_repeat('Long enough content. ', 5),
+            ]);
+
+        $response->assertCreated()
+            ->assertJsonStructure(['data' => ['id', 'title', 'slug', 'created_at']])
+            ->assertJsonPath('data.title', 'My Post Title');
+
+        $this->assertDatabaseHas('posts', [
+            'slug'    => 'my-post-title',
+            'user_id' => $this->user->id,
+        ]);
+    }
+
+    public function test_returns_422_for_duplicate_slug(): void
+    {
+        Post::factory()->create(['slug' => 'taken-slug', 'user_id' => $this->user->id]);
+
+        $this->actingAs($this->user)
+            ->postJson('/api/v1/posts', [
+                'title'   => 'Different Title',
+                'slug'    => 'taken-slug',
+                'content' => str_repeat('Content. ', 5),
+            ])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['slug']);
+    }
+
+    public function test_unauthenticated_request_returns_401(): void
+    {
+        $this->postJson('/api/v1/posts', [])->assertUnauthorized();
+    }
+
+    public function test_user_cannot_update_another_users_post(): void
+    {
+        $post = Post::factory()->create(); // different user
+
+        $this->actingAs($this->user)
+            ->putJson("/api/v1/posts/{$post->id}", ['title' => 'Hijacked'])
+            ->assertForbidden();
+    }
+}
+```
+
+### Model Factory Patterns
+```php
+// database/factories/PostFactory.php
+class PostFactory extends Factory
+{
+    public function definition(): array
+    {
+        return [
+            'user_id'   => User::factory(),   // auto-creates related user
+            'title'     => $this->faker->sentence(4),
+            'slug'      => $this->faker->unique()->slug(),
+            'content'   => $this->faker->paragraphs(3, true),
+            'published' => false,
+        ];
+    }
+
+    // State methods for common variations
+    public function published(): static
+    {
+        return $this->state(['published' => true, 'published_at' => now()]);
+    }
+
+    public function forUser(User $user): static
+    {
+        return $this->state(['user_id' => $user->id]);
+    }
+}
+
+// Usage: Post::factory()->published()->forUser($user)->count(3)->create()
+```
+
+---
+
+## What to Test — Decision Guide
+
+```
+Is it a pure function (same input = same output)?     → Unit test every case + edge cases
+Is it a React component?                              → Test user interactions and rendered output, not internals
+Is it a data fetch / API call?                        → Integration test with mocked network
+Is it a critical user journey (login, checkout)?      → E2E test with Playwright
+Is it a third-party library call?                     → Mock it, don't test the library
+Is it a one-liner utility wrapping a library?         → Skip it
+Is it a Laravel API endpoint?                         → Feature test with RefreshDatabase
+Is it a complex business rule?                        → Unit test the Service/Action class directly
+```
+
+---
+
+## Rules
+
+- **Never** test implementation details — test what the code does, not how
+- **Always** use `userEvent` over `fireEvent` in React tests — it models real browser behaviour
+- **Always** use Page Object Model in Playwright — never inline selectors in test bodies
+- **Always** prefer `getByRole` and `getByLabel` selectors — they enforce accessibility
+- **Never** use `data-testid` as a first resort — only when semantic selectors aren't possible
+- **Always** mock at the module boundary — not inside individual test cases
+- **Always** use `RefreshDatabase` in Laravel feature tests — never assume DB state
+- **Always** use factory states — never hardcode test data inline
+- Set coverage thresholds and enforce them in CI — 80% lines minimum
+- Tests must pass in under 30s locally — slow tests don't get run
+- **Never** commit `test.only` or `test.skip` without a tracked issue

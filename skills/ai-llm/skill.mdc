@@ -1,0 +1,534 @@
+---
+description: Expert guidance for integrating LLMs into applications — prompt engineering, RAG pipelines, structured outputs, evals, cost management, streaming, multi-modal, and production observability. Use when writing prompts, building RAG systems, designing eval pipelines, managing token budgets, or integrating any LLM API (OpenAI, Anthropic, local models via Ollama).
+globs:
+  - "**/prompts/**/*.{ts,js,md}"
+  - "**/lib/ai/**/*.{ts,js}"
+  - "**/lib/llm/**/*.{ts,js}"
+  - "**/lib/rag/**/*.{ts,js}"
+  - "**/evals/**/*.{ts,js}"
+  - "**/*prompt*.{ts,js}"
+  - "**/*embedding*.{ts,js}"
+alwaysApply: false
+---
+
+# AI / LLM Integration — Expert Skill
+
+You are an expert in production LLM systems — prompt engineering, RAG architecture, eval design, and cost-efficient inference. Apply these patterns whether integrating OpenAI, Anthropic, or local models via Ollama/MLX.
+
+---
+
+## Model Routing
+
+Never hardcode model strings. Always route by capability tier:
+
+```typescript
+// lib/models.config.ts — single source of truth
+export const MODELS = {
+  // Tier: capability → cost tradeoff
+  FAST:        process.env.MODEL_FAST        ?? 'gpt-4o-mini',       // high volume, low latency
+  REASONING:   process.env.MODEL_REASONING   ?? 'gpt-4o',            // complex decisions, structured output
+  CHEAP:       process.env.MODEL_CHEAP       ?? 'gpt-4o-mini',       // background jobs, classification
+  LOCAL:       process.env.MODEL_LOCAL       ?? 'qwen2.5-coder:32b', // offline, sensitive data, dev
+  MULTIMODAL:  process.env.MODEL_MULTIMODAL  ?? 'gpt-4o',            // vision, audio
+  EMBEDDING:   process.env.MODEL_EMBEDDING   ?? 'text-embedding-3-small',
+} as const;
+
+export type ModelTier = keyof typeof MODELS;
+
+// Routing logic — add context-awareness here as needed
+export function selectModel(tier: ModelTier, opts?: { forceLocal?: boolean }): string {
+  if (opts?.forceLocal || process.env.USE_LOCAL_MODELS === 'true') {
+    return MODELS.LOCAL;
+  }
+  return MODELS[tier];
+}
+```
+
+---
+
+## Prompt Engineering
+
+### Prompt Architecture
+```typescript
+// prompts/base.ts — structured prompt composition
+interface PromptParts {
+  system: string;
+  context?: string;
+  examples?: Array<{ input: string; output: string }>;
+  instructions: string;
+  outputFormat?: string;
+}
+
+function buildPrompt(parts: PromptParts): string {
+  const sections: string[] = [parts.system];
+
+  if (parts.context) {
+    sections.push(`## Context\n${parts.context}`);
+  }
+
+  if (parts.examples?.length) {
+    const exBlock = parts.examples
+      .map((e, i) => `Example ${i + 1}:\nInput: ${e.input}\nOutput: ${e.output}`)
+      .join('\n\n');
+    sections.push(`## Examples\n${exBlock}`);
+  }
+
+  sections.push(`## Task\n${parts.instructions}`);
+
+  if (parts.outputFormat) {
+    sections.push(`## Output Format\n${parts.outputFormat}`);
+  }
+
+  return sections.join('\n\n');
+}
+```
+
+### Prompt Versioning
+```typescript
+// prompts/classify.ts — version every prompt, never edit in-place
+export const CLASSIFY_PROMPT_V2 = {
+  version: 'v2',
+  updatedAt: '2025-03-01',
+  changelog: 'Added edge case examples for ambiguous inputs',
+
+  system: `You are a classification expert. Classify user inputs into exactly one category.
+Categories: QUESTION | REQUEST | FEEDBACK | COMPLAINT | OTHER
+
+Rules:
+- Return only the category name, nothing else
+- When ambiguous, prefer the more specific category
+- Inputs with "?" are usually QUESTION, not REQUEST`,
+
+  examples: [
+    { input: 'How do I reset my password?', output: 'QUESTION' },
+    { input: 'Please update my email',      output: 'REQUEST'  },
+    { input: 'This is broken',              output: 'COMPLAINT'},
+  ],
+} as const;
+
+// Always log which version was used — essential for debugging regressions
+log.info('llm call', { promptVersion: CLASSIFY_PROMPT_V2.version, model: selectModel('CHEAP') });
+```
+
+### Chain-of-Thought for Reasoning Tasks
+```typescript
+// For complex decisions — prompt for reasoning before the answer
+const COT_SYSTEM = `You are a decision engine. When asked to decide, always:
+1. State what information you have
+2. Identify what's uncertain or missing
+3. Reason through the tradeoffs
+4. State your decision with confidence level (0.0-1.0)
+5. Return structured JSON matching the schema exactly`;
+
+// Then validate with Zod — never trust the raw output
+const DecisionSchema = z.object({
+  reasoning:  z.string().min(20),   // force non-trivial reasoning
+  decision:   z.string(),
+  confidence: z.number().min(0).max(1),
+  caveats:    z.array(z.string()).optional(),
+});
+```
+
+---
+
+## Structured Output
+
+Always use structured output — never parse free-form LLM text:
+
+```typescript
+import OpenAI from 'openai';
+import { z } from 'zod';
+import { zodResponseFormat } from 'openai/helpers/zod';
+
+const client = new OpenAI();
+
+const ExtractedDataSchema = z.object({
+  title:    z.string(),
+  summary:  z.string().max(500),
+  topics:   z.array(z.string()).max(5),
+  sentiment: z.enum(['positive', 'neutral', 'negative']),
+  score:    z.number().min(0).max(10),
+});
+
+type ExtractedData = z.infer<typeof ExtractedDataSchema>;
+
+export async function extractFromText(text: string): Promise<ExtractedData> {
+  const response = await client.beta.chat.completions.parse({
+    model: selectModel('REASONING'),
+    messages: [
+      { role: 'system', content: 'Extract structured data from the provided text.' },
+      { role: 'user',   content: text },
+    ],
+    response_format: zodResponseFormat(ExtractedDataSchema, 'extracted_data'),
+    temperature: 0.1,  // low for structured extraction
+  });
+
+  const parsed = response.choices[0].message.parsed;
+  if (!parsed) throw new Error('Structured output parsing failed');
+  return parsed;
+}
+```
+
+### Anthropic Structured Output
+```typescript
+import Anthropic from '@anthropic-ai/sdk';
+
+const anthropic = new Anthropic();
+
+export async function reasonWithClaude(prompt: string): Promise<Decision> {
+  const message = await anthropic.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1024,
+    system: `${SYSTEM_PROMPT}\n\nYou MUST respond with valid JSON matching this schema exactly:\n${JSON.stringify(DecisionSchema.shape)}`,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
+  const text = message.content
+    .filter(b => b.type === 'text')
+    .map(b => b.text)
+    .join('');
+
+  // Strip markdown fences if present
+  const clean = text.replace(/^```(?:json)?\n?/m, '').replace(/\n?```$/m, '').trim();
+  return DecisionSchema.parse(JSON.parse(clean));
+}
+```
+
+---
+
+## RAG Pipeline
+
+### Document Chunking
+```typescript
+// lib/rag/chunker.ts
+interface Chunk {
+  id: string;
+  content: string;
+  metadata: {
+    source: string;
+    chunkIndex: number;
+    totalChunks: number;
+    startChar: number;
+    endChar: number;
+  };
+}
+
+export function chunkText(
+  text: string,
+  source: string,
+  opts: { chunkSize?: number; overlap?: number } = {}
+): Chunk[] {
+  const { chunkSize = 512, overlap = 64 } = opts;
+  const chunks: Chunk[] = [];
+  let start = 0;
+  let index = 0;
+
+  // Split on sentence boundaries when possible — preserve semantic units
+  const sentences = text.match(/[^.!?]+[.!?]+/g) ?? [text];
+  let current = '';
+
+  for (const sentence of sentences) {
+    if ((current + sentence).length > chunkSize && current.length > 0) {
+      chunks.push({
+        id: `${source}-${index}`,
+        content: current.trim(),
+        metadata: { source, chunkIndex: index, totalChunks: 0, startChar: start, endChar: start + current.length },
+      });
+      // Overlap: keep last N chars for context continuity
+      current = current.slice(-overlap) + sentence;
+      start += current.length - overlap;
+      index++;
+    } else {
+      current += sentence;
+    }
+  }
+
+  if (current.trim()) {
+    chunks.push({
+      id: `${source}-${index}`,
+      content: current.trim(),
+      metadata: { source, chunkIndex: index, totalChunks: 0, startChar: start, endChar: start + current.length },
+    });
+  }
+
+  // Backfill totalChunks
+  const total = chunks.length;
+  return chunks.map(c => ({ ...c, metadata: { ...c.metadata, totalChunks: total } }));
+}
+```
+
+### Retrieval + Reranking
+```typescript
+// lib/rag/retriever.ts
+interface RetrievedChunk extends Chunk {
+  similarity: number;
+}
+
+export async function retrieve(
+  supabase: SupabaseClient,
+  query: string,
+  opts: { limit?: number; threshold?: number; rerank?: boolean } = {}
+): Promise<RetrievedChunk[]> {
+  const { limit = 10, threshold = 0.7, rerank = true } = opts;
+
+  // Step 1: Embed the query
+  const queryEmbedding = await embed(query);
+
+  // Step 2: Vector search
+  const { data, error } = await supabase.rpc('search_documents', {
+    query_embedding: queryEmbedding,
+    match_count: rerank ? limit * 3 : limit,  // fetch more if reranking
+    match_threshold: threshold,
+  });
+  if (error) throw error;
+
+  // Step 3: Rerank with LLM (optional — improves precision, adds cost)
+  if (!rerank || !data?.length) return data ?? [];
+  return rerankChunks(query, data, limit);
+}
+
+async function rerankChunks(
+  query: string,
+  chunks: RetrievedChunk[],
+  limit: number
+): Promise<RetrievedChunk[]> {
+  // Simple LLM reranker — score each chunk's relevance to the query
+  const scores = await Promise.all(
+    chunks.map(async (chunk) => {
+      const response = await client.chat.completions.create({
+        model: selectModel('CHEAP'),
+        messages: [{
+          role: 'user',
+          content: `Rate how relevant this passage is to answering the query.
+Query: ${query}
+Passage: ${chunk.content}
+Return only a number 0-10.`,
+        }],
+        temperature: 0,
+        max_tokens: 5,
+      });
+      const score = parseFloat(response.choices[0].message.content ?? '0');
+      return { ...chunk, rerankScore: isNaN(score) ? 0 : score };
+    })
+  );
+
+  return scores
+    .sort((a, b) => b.rerankScore - a.rerankScore)
+    .slice(0, limit);
+}
+```
+
+### RAG Response Generation
+```typescript
+// lib/rag/generate.ts
+export async function generateWithContext(
+  query: string,
+  chunks: RetrievedChunk[]
+): Promise<{ answer: string; sources: string[] }> {
+  if (!chunks.length) {
+    return { answer: "I don't have enough information to answer that.", sources: [] };
+  }
+
+  const context = chunks
+    .map((c, i) => `[${i + 1}] (Source: ${c.metadata.source})\n${c.content}`)
+    .join('\n\n');
+
+  const response = await client.chat.completions.create({
+    model: selectModel('REASONING'),
+    messages: [
+      {
+        role: 'system',
+        content: `Answer questions using only the provided context.
+If the context doesn't contain enough information, say so — do not hallucinate.
+Cite sources using [N] notation matching the context numbers.`,
+      },
+      { role: 'user', content: `Context:\n${context}\n\nQuestion: ${query}` },
+    ],
+    temperature: 0.2,
+  });
+
+  const answer = response.choices[0].message.content ?? '';
+  const sources = [...new Set(chunks.map(c => c.metadata.source))];
+  return { answer, sources };
+}
+```
+
+---
+
+## Evals
+
+Never ship a prompt change without running evals:
+
+```typescript
+// evals/classify.eval.ts
+interface EvalCase {
+  input: string;
+  expected: string;
+  description?: string;
+}
+
+interface EvalResult {
+  input: string;
+  expected: string;
+  actual: string;
+  passed: boolean;
+  latencyMs: number;
+  tokensUsed: number;
+}
+
+const TEST_CASES: EvalCase[] = [
+  { input: 'How do I reset my password?', expected: 'QUESTION',  description: 'Clear question' },
+  { input: 'Please update my email',      expected: 'REQUEST',   description: 'Clear request' },
+  { input: 'This is broken',              expected: 'COMPLAINT', description: 'Implicit complaint' },
+  { input: 'Just checking in',            expected: 'OTHER',     description: 'Ambiguous' },
+  // Always include edge cases that previously failed
+];
+
+export async function runEvals(promptVersion: string): Promise<void> {
+  const results: EvalResult[] = [];
+
+  for (const tc of TEST_CASES) {
+    const start = Date.now();
+    const actual = await classify(tc.input);
+    const latencyMs = Date.now() - start;
+
+    results.push({
+      input: tc.input,
+      expected: tc.expected,
+      actual,
+      passed: actual === tc.expected,
+      latencyMs,
+      tokensUsed: 0, // fill from response.usage
+    });
+  }
+
+  const passed = results.filter(r => r.passed).length;
+  const accuracy = passed / results.length;
+
+  console.table(results.map(r => ({
+    input: r.input.slice(0, 30),
+    expected: r.expected,
+    actual: r.actual,
+    passed: r.passed ? 'Y' : 'FAIL',
+    ms: r.latencyMs,
+  })));
+
+  console.log(`\nAccuracy: ${(accuracy * 100).toFixed(1)}% (${passed}/${results.length})`);
+
+  // Fail CI if accuracy drops below threshold
+  if (accuracy < 0.9) {
+    throw new Error(`Eval failed: accuracy ${accuracy} < 0.9 threshold`);
+  }
+}
+```
+
+---
+
+## Cost Management
+
+```typescript
+// lib/ai/cost-tracker.ts — track spend per feature/user
+const TOKEN_COSTS_PER_1K = {
+  'gpt-4o':           { input: 0.0025, output: 0.01   },
+  'gpt-4o-mini':      { input: 0.00015, output: 0.0006 },
+  'claude-sonnet-4':  { input: 0.003,  output: 0.015  },
+  'text-embedding-3-small': { input: 0.00002, output: 0 },
+} as const;
+
+export function estimateCost(
+  model: string,
+  inputTokens: number,
+  outputTokens: number
+): number {
+  const rates = TOKEN_COSTS_PER_1K[model as keyof typeof TOKEN_COSTS_PER_1K];
+  if (!rates) return 0;
+  return (inputTokens / 1000) * rates.input + (outputTokens / 1000) * rates.output;
+}
+
+// Wrap every LLM call with cost tracking
+export async function trackedCompletion(
+  params: OpenAI.ChatCompletionCreateParams,
+  context: { feature: string; userId?: string }
+): Promise<OpenAI.ChatCompletion> {
+  const response = await client.chat.completions.create(params);
+  const cost = estimateCost(
+    params.model,
+    response.usage?.prompt_tokens ?? 0,
+    response.usage?.completion_tokens ?? 0
+  );
+
+  log.info('llm usage', {
+    model: params.model,
+    feature: context.feature,
+    userId: context.userId,
+    inputTokens:  response.usage?.prompt_tokens,
+    outputTokens: response.usage?.completion_tokens,
+    estimatedCostUsd: cost,
+  });
+
+  return response;
+}
+```
+
+### Token Budget Enforcement
+```typescript
+// Estimate tokens before sending — prevent runaway costs
+import { encoding_for_model } from 'tiktoken';
+
+export function countTokens(text: string, model = 'gpt-4o'): number {
+  const enc = encoding_for_model(model as Parameters<typeof encoding_for_model>[0]);
+  const count = enc.encode(text).length;
+  enc.free();
+  return count;
+}
+
+export function truncateToTokenLimit(text: string, maxTokens: number, model = 'gpt-4o'): string {
+  const enc = encoding_for_model(model as Parameters<typeof encoding_for_model>[0]);
+  const tokens = enc.encode(text);
+  if (tokens.length <= maxTokens) { enc.free(); return text; }
+  const truncated = new TextDecoder().decode(enc.decode(tokens.slice(0, maxTokens)));
+  enc.free();
+  return truncated;
+}
+```
+
+---
+
+## Local Models (Ollama)
+
+```typescript
+// lib/ai/ollama.ts — drop-in replacement for OpenAI client
+import OpenAI from 'openai'; // Ollama exposes OpenAI-compatible API
+
+export const ollama = new OpenAI({
+  baseURL: process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434/v1',
+  apiKey: 'ollama', // required by client, not used by Ollama
+});
+
+// Use the same interface — swap providers without changing call sites
+export async function localCompletion(prompt: string): Promise<string> {
+  const response = await ollama.chat.completions.create({
+    model: process.env.MODEL_LOCAL ?? 'qwen2.5-coder:32b',
+    messages: [{ role: 'user', content: prompt }],
+    temperature: 0.2,
+  });
+  return response.choices[0].message.content ?? '';
+}
+```
+
+---
+
+## Rules
+
+- **Never** hardcode model names — always use `models.config.ts` tier aliases
+- **Always** validate LLM output with Zod — never use raw text as structured data
+- **Always** version prompts — log prompt version with every LLM call
+- **Always** track token usage and estimated cost per call
+- **Never** ship a prompt change to production without running evals first
+- **Always** handle the "empty context" case in RAG — do not hallucinate when context is thin
+- Use `temperature: 0.1–0.2` for structured extraction, `0.7–0.9` for creative generation
+- Use `CHEAP` tier for classification and routing decisions; `REASONING` only when necessary
+- **Always** set `max_tokens` explicitly — never rely on API defaults
+- Chunk documents at semantic boundaries (sentences/paragraphs), not arbitrary character counts
+- Cache embeddings — never re-embed the same content twice
+- Prefer local models for dev and sensitive data; cloud models for production reasoning tasks

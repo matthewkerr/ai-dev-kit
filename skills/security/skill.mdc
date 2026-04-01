@@ -1,0 +1,464 @@
+---
+description: Expert security guidance — authentication patterns, secrets management, OWASP Top 10 mitigations, rate limiting, input validation, privacy-first data handling, and secure coding practices. Use when implementing auth, handling user data, writing API endpoints, managing secrets, or reviewing any code that touches security boundaries.
+globs:
+  - "**/middleware/**/*.{ts,js,php}"
+  - "**/auth/**/*.{ts,js,php}"
+  - "**/lib/auth*"
+  - "**/*auth*.{ts,js}"
+  - "**/*security*.{ts,js}"
+  - "**/api/**/*.{ts,js}"
+  - ".env*"
+alwaysApply: false
+---
+
+# Security — Expert Skill
+
+You are a security-conscious senior engineer. Every feature that touches user data, authentication, or external input is a potential attack surface. Apply defence in depth — multiple layers, not a single check.
+
+---
+
+## Authentication & Sessions
+
+### JWT Patterns
+```typescript
+// lib/auth/jwt.ts
+import { SignJWT, jwtVerify, type JWTPayload } from 'jose';
+
+const SECRET = new TextEncoder().encode(process.env.JWT_SECRET!);
+
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  throw new Error('JWT_SECRET must be at least 32 characters');
+}
+
+interface AppJWTPayload extends JWTPayload {
+  userId: string;
+  role: 'user' | 'admin';
+  sessionId: string; // allows server-side invalidation
+}
+
+export async function signToken(payload: Omit<AppJWTPayload, 'iat' | 'exp'>): Promise<string> {
+  return new SignJWT(payload)
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('15m')   // short-lived access token
+    .setIssuer('myapp')
+    .setAudience('myapp-client')
+    .sign(SECRET);
+}
+
+export async function verifyToken(token: string): Promise<AppJWTPayload> {
+  const { payload } = await jwtVerify(token, SECRET, {
+    issuer: 'myapp',
+    audience: 'myapp-client',
+  });
+  return payload as AppJWTPayload;
+}
+
+// Refresh token — long-lived, stored in httpOnly cookie, rotated on use
+export async function signRefreshToken(userId: string, sessionId: string): Promise<string> {
+  return new SignJWT({ userId, sessionId, type: 'refresh' })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('30d')
+    .sign(SECRET);
+}
+```
+
+### Cookie Security
+```typescript
+// Always set these cookie options — never send session tokens over HTTP
+export function setAuthCookies(res: NextResponse, accessToken: string, refreshToken: string) {
+  const cookieOpts = {
+    httpOnly: true,           // no JS access — prevents XSS theft
+    secure: process.env.NODE_ENV === 'production',  // HTTPS only in prod
+    sameSite: 'lax' as const, // CSRF protection; 'strict' for high-security flows
+    path: '/',
+  };
+
+  res.cookies.set('access_token',  accessToken,  { ...cookieOpts, maxAge: 15 * 60 });        // 15 min
+  res.cookies.set('refresh_token', refreshToken, { ...cookieOpts, maxAge: 30 * 24 * 60 * 60 }); // 30 days
+}
+
+// Never store tokens in localStorage or sessionStorage — XSS-accessible
+// Never store sensitive data in non-httpOnly cookies
+```
+
+### Session Invalidation
+```typescript
+// Track active sessions in DB — allows server-side logout and revocation
+interface Session {
+  id: string;       // stored in JWT as sessionId
+  userId: string;
+  createdAt: Date;
+  lastSeenAt: Date;
+  userAgent?: string;
+  ipAddress?: string;
+  revokedAt?: Date; // set on logout
+}
+
+export async function validateSession(sessionId: string): Promise<boolean> {
+  const session = await db.session.findUnique({ where: { id: sessionId } });
+  return !!(session && !session.revokedAt);
+}
+
+// On logout — revoke session so existing tokens become invalid
+export async function revokeSession(sessionId: string): Promise<void> {
+  await db.session.update({
+    where: { id: sessionId },
+    data: { revokedAt: new Date() },
+  });
+}
+```
+
+---
+
+## Input Validation & Sanitization
+
+### Never Trust Input
+```typescript
+// All external input must be validated before use — forms, APIs, webhooks, URL params
+import { z } from 'zod';
+import DOMPurify from 'isomorphic-dompurify';
+
+// Zod schema as the single source of validation truth
+const UserInputSchema = z.object({
+  name:    z.string().min(1).max(100).trim(),
+  email:   z.string().email().toLowerCase().trim(),
+  bio:     z.string().max(500).optional().transform(v => v ? DOMPurify.sanitize(v) : v),
+  website: z.string().url().optional().refine(url => {
+    // Only allow http/https — prevent javascript: protocol injection
+    return !url || url.startsWith('http://') || url.startsWith('https://');
+  }, 'Only http/https URLs allowed'),
+});
+
+// Validate at the API boundary — before any business logic
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+  const result = UserInputSchema.safeParse(body);
+
+  if (!result.success) {
+    return NextResponse.json(
+      { error: 'Invalid input', details: result.error.flatten() },
+      { status: 400 }
+    );
+  }
+
+  // result.data is now safe to use
+  await createUser(result.data);
+}
+```
+
+### SQL Injection Prevention
+```typescript
+// Always use parameterised queries — never string interpolation
+// Supabase client handles this automatically via the query builder
+
+// NEVER:
+const bad = await supabase.rpc(`SELECT * FROM posts WHERE title = '${userInput}'`);
+
+// ALWAYS — parameterised:
+const good = await supabase
+  .from('posts')
+  .select('*')
+  .eq('title', userInput);  // automatically escaped
+
+// For raw Postgres (Edge Functions):
+const result = await client.query(
+  'SELECT * FROM posts WHERE title = $1 AND user_id = $2',
+  [userInput, userId]  // $N parameters — never template literals
+);
+```
+
+---
+
+## Rate Limiting
+
+```typescript
+// lib/security/rate-limit.ts
+import { Ratelimit } from '@upstash/ratelimit';
+import { Redis } from '@upstash/redis';
+
+const redis = new Redis({
+  url:   process.env.UPSTASH_REDIS_REST_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+});
+
+// Different limiters for different endpoints
+export const rateLimiters = {
+  // Public API — 60 req/min per IP
+  api: new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(60, '1 m'),
+    prefix: 'rl:api',
+  }),
+  // Auth endpoints — strict, 5 attempts per 15 min per IP
+  auth: new Ratelimit({
+    redis,
+    limiter: Ratelimit.fixedWindow(5, '15 m'),
+    prefix: 'rl:auth',
+    analytics: true,
+  }),
+  // LLM endpoints — 20 req/min per user (cost protection)
+  llm: new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(20, '1 m'),
+    prefix: 'rl:llm',
+  }),
+};
+
+// Middleware helper
+export async function checkRateLimit(
+  limiter: Ratelimit,
+  identifier: string
+): Promise<NextResponse | null> {
+  const { success, limit, remaining, reset } = await limiter.limit(identifier);
+
+  if (!success) {
+    return NextResponse.json(
+      { error: 'Too many requests' },
+      {
+        status: 429,
+        headers: {
+          'X-RateLimit-Limit':     String(limit),
+          'X-RateLimit-Remaining': String(remaining),
+          'X-RateLimit-Reset':     String(reset),
+          'Retry-After':           String(Math.ceil((reset - Date.now()) / 1000)),
+        },
+      }
+    );
+  }
+  return null;
+}
+```
+
+---
+
+## OWASP Top 10 Mitigations
+
+### A01 — Broken Access Control
+```typescript
+// Always check authorisation at the data layer, not just the route
+// Never rely solely on "the UI hides the button"
+
+export async function getPost(postId: string, requestingUserId: string): Promise<Post> {
+  const post = await db.post.findUnique({ where: { id: postId } });
+
+  if (!post) throw new NotFoundError('Post', postId);
+
+  // Explicit ownership check — even if the route is "authenticated"
+  if (post.userId !== requestingUserId && !post.published) {
+    throw new ForbiddenError('Cannot access unpublished post');
+  }
+
+  return post;
+}
+```
+
+### A02 — Cryptographic Failures
+```typescript
+// Passwords — always bcrypt/argon2, never MD5/SHA1/plain
+import { hash, verify } from '@node-rs/argon2';
+
+export async function hashPassword(password: string): Promise<string> {
+  return hash(password, {
+    memoryCost: 19456,  // 19 MiB
+    timeCost: 2,
+    outputLen: 32,
+    parallelism: 1,
+  });
+}
+
+export async function verifyPassword(hash: string, password: string): Promise<boolean> {
+  return verify(hash, password);
+}
+
+// Tokens — use crypto.randomBytes, never Math.random()
+import { randomBytes } from 'crypto';
+
+export function generateSecureToken(bytes = 32): string {
+  return randomBytes(bytes).toString('hex');
+}
+```
+
+### A03 — Injection (XSS)
+```typescript
+// React auto-escapes JSX — dangerous patterns to avoid:
+
+// NEVER — arbitrary HTML from user input
+<div dangerouslySetInnerHTML={{ __html: userContent }} />
+
+// SAFER — sanitize first if rich text is a requirement
+import DOMPurify from 'isomorphic-dompurify';
+const clean = DOMPurify.sanitize(userContent, {
+  ALLOWED_TAGS: ['p', 'b', 'i', 'em', 'strong', 'a', 'ul', 'ol', 'li'],
+  ALLOWED_ATTR: ['href'],
+  ALLOW_DATA_ATTR: false,
+});
+<div dangerouslySetInnerHTML={{ __html: clean }} />
+
+// Content Security Policy — set via headers, not meta tags
+// In next.config.ts:
+const securityHeaders = [
+  { key: 'Content-Security-Policy', value: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';" },
+  { key: 'X-Frame-Options', value: 'DENY' },
+  { key: 'X-Content-Type-Options', value: 'nosniff' },
+  { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
+  { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=()' },
+];
+```
+
+### A07 — Authentication Failures
+```typescript
+// Constant-time comparison for secrets — prevents timing attacks
+import { timingSafeEqual } from 'crypto';
+
+export function safeCompare(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+// Account enumeration prevention — same response for valid and invalid email
+export async function login(email: string, password: string): Promise<AuthResult> {
+  const user = await db.user.findUnique({ where: { email } });
+
+  // Always run the hash comparison — even if user doesn't exist
+  // This prevents timing-based user enumeration
+  const dummyHash = '$argon2id$v=19$m=19456,t=2,p=1$dummy';
+  const hashToVerify = user?.passwordHash ?? dummyHash;
+  const valid = await verifyPassword(hashToVerify, password);
+
+  if (!user || !valid) {
+    throw new UnauthorizedError('Invalid credentials'); // same message always
+  }
+
+  return createSession(user);
+}
+```
+
+---
+
+## Privacy-First Data Handling
+
+```typescript
+// Collect minimum data — only what is necessary for the feature
+// Document data retention and deletion policies in code
+
+interface UserData {
+  id: string;
+  email: string;              // required for auth
+  displayName?: string;       // optional — user's choice
+  // NEVER collect without explicit consent:
+  // - precise location
+  // - device fingerprint
+  // - behavioral tracking
+}
+
+// Data deletion — implement before collecting data, not after
+export async function deleteUserData(userId: string): Promise<void> {
+  // Hard delete, not soft — "privacy for invisible people" means actual deletion
+  await Promise.all([
+    db.post.deleteMany({ where: { userId } }),
+    db.session.deleteMany({ where: { userId } }),
+    db.user.delete({ where: { id: userId } }),
+    s3.deleteUserUploads(userId),   // remove all stored files
+    analytics.deleteUser(userId),   // purge analytics events
+  ]);
+}
+
+// Anonymisation for logs — never log PII
+export function anonymiseForLogging(user: UserData): Record<string, unknown> {
+  return {
+    userId: user.id,          // ID is ok — not PII
+    hasEmail: !!user.email,   // boolean presence only
+    // email: user.email      // NEVER
+    // ip: request.ip         // NEVER in persistent logs
+  };
+}
+```
+
+### Secrets Audit
+```typescript
+// Run in CI — detect accidentally committed secrets
+// .github/workflows/secrets-scan.yml:
+// - uses: trufflesecurity/trufflehog@main
+//   with: { path: './', base: '${{ github.event.repository.default_branch }}' }
+
+// Environment variable checklist — verify these exist at startup
+const REQUIRED_SECRETS = [
+  'JWT_SECRET',
+  'DATABASE_URL',
+  'SUPABASE_SERVICE_ROLE_KEY',
+] as const;
+
+export function validateSecrets(): void {
+  const missing = REQUIRED_SECRETS.filter(key => !process.env[key]);
+  if (missing.length > 0) {
+    throw new Error(`Missing required secrets: ${missing.join(', ')}`);
+  }
+
+  if ((process.env.JWT_SECRET?.length ?? 0) < 32) {
+    throw new Error('JWT_SECRET must be at least 32 characters');
+  }
+}
+
+// Call at app startup — fail fast if misconfigured
+validateSecrets();
+```
+
+---
+
+## Security Headers (Next.js)
+
+```typescript
+// next.config.ts
+const securityHeaders = [
+  { key: 'X-DNS-Prefetch-Control',  value: 'on' },
+  { key: 'X-Frame-Options',         value: 'DENY' },
+  { key: 'X-Content-Type-Options',  value: 'nosniff' },
+  { key: 'Referrer-Policy',         value: 'strict-origin-when-cross-origin' },
+  { key: 'Permissions-Policy',      value: 'camera=(), microphone=(), geolocation=(), payment=()' },
+  {
+    key: 'Strict-Transport-Security',
+    value: 'max-age=63072000; includeSubDomains; preload', // 2 years
+  },
+  {
+    key: 'Content-Security-Policy',
+    value: [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline'",          // unsafe-inline needed for Next.js — tighten with nonces in future
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: https:",
+      "font-src 'self'",
+      "connect-src 'self' https://*.supabase.co",   // add your API domains
+      "frame-ancestors 'none'",
+    ].join('; '),
+  },
+];
+
+export default {
+  async headers() {
+    return [{ source: '/(.*)', headers: securityHeaders }];
+  },
+};
+```
+
+---
+
+## Rules
+
+- **Never** store passwords in plaintext or with reversible encryption — always argon2/bcrypt
+- **Never** store auth tokens in localStorage — httpOnly cookies only
+- **Always** validate and sanitize all external input with Zod before use
+- **Always** use parameterised queries — never string interpolation in SQL
+- **Always** rate-limit auth endpoints — minimum 5 attempts / 15 min per IP
+- **Always** use `timingSafeEqual` for secret/token comparison
+- **Always** set security headers — CSP, HSTS, X-Frame-Options minimum
+- **Never** log PII — anonymise at the boundary before writing to any log
+- **Always** implement account deletion before launch — not as a later feature
+- **Always** use HTTPS in production — reject HTTP at the load balancer
+- **Never** expose stack traces or internal error details to API consumers
+- Collect minimum necessary data — privacy is a feature, not a compliance checkbox
+- Validate secrets at startup — fail fast rather than running with a broken security config
+- Scan for committed secrets in CI — `trufflehog` or `gitleaks` on every PR

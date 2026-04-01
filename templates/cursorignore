@@ -1,0 +1,136 @@
+# FILE: .cursorignore
+# PURPOSE: Prevents Cursor from indexing paths that add noise and cost tokens without
+#          providing useful context — build artifacts, dependencies, binaries, secrets,
+#          generated files, and large assets the AI can't use anyway.
+#          Drop this in the root of every project. Directly reduces token consumption
+#          on every Cursor operation from the moment it's added.
+# MAINTAIN: If you add a new build output directory or generated file type, add it here.
+# NOTE: Some entries have un-ignore comments (e.g. !package-lock.json) — adjust to taste.
+
+# .cursorignore
+# Tells Cursor not to index these paths.
+# Keeps token cost lean and prevents noise in AI context.
+# Add this to every project root.
+
+# ─── Node / JS ───────────────────────────────────────────────────────────────
+node_modules/
+.npm/
+.yarn/
+.pnp/
+.pnp.js
+
+# ─── Build outputs ───────────────────────────────────────────────────────────
+.next/
+.nuxt/
+.output/
+dist/
+build/
+out/
+.turbo/
+.cache/
+*.tsbuildinfo
+
+# ─── Expo / React Native ─────────────────────────────────────────────────────
+.expo/
+android/
+ios/
+*.apk
+*.ipa
+*.aab
+
+# ─── Laravel / PHP ───────────────────────────────────────────────────────────
+vendor/
+bootstrap/cache/
+storage/framework/cache/
+storage/framework/sessions/
+storage/framework/views/
+storage/logs/
+public/hot
+public/storage
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env/
+*.egg-info/
+dist/
+*.dist-info/
+
+# ─── Testing ─────────────────────────────────────────────────────────────────
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+evals/results/          # eval run history — large JSON, not useful as context
+
+# ─── Supabase ────────────────────────────────────────────────────────────────
+supabase/.branches/
+supabase/.temp/
+
+# ─── AWS / Terraform ─────────────────────────────────────────────────────────
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+cdk.out/
+
+# ─── Assets — large files the AI can't use anyway ────────────────────────────
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+*.ico
+*.mp4
+*.mov
+*.mp3
+*.wav
+*.pdf
+*.zip
+*.tar.gz
+*.dmg
+*.ttf
+*.otf
+*.woff
+*.woff2
+
+# ─── Generated / machine-written ─────────────────────────────────────────────
+*.lock                  # package-lock.json, composer.lock, etc. — too large
+!package-lock.json      # un-ignore if you want Cursor to know exact deps
+src/lib/database.types.ts  # Supabase generated types — re-generate, don't edit
+
+# ─── Secrets & local config ──────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+.env.production
+*.pem
+*.p12
+*.key
+*.crt
+google-service-account.json
+*-service-account.json
+
+# ─── IDE & OS ────────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/settings.json  # keep .vscode/extensions.json — that's useful context
+Thumbs.db
+*.swp
+*.swo
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── Misc ────────────────────────────────────────────────────────────────────
+.git/
+tmp/
+temp/
+.temp/

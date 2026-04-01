@@ -1,0 +1,493 @@
+---
+description: Expert guidance for building production-grade Next.js applications with React. Covers App Router architecture, server/client component boundaries, data fetching patterns, TypeScript conventions, performance, and full scaffolding. Use when building pages, components, layouts, API routes, server actions, middleware, or any Next.js feature.
+globs:
+  - "**/app/**/*.{tsx,ts}"
+  - "**/components/**/*.{tsx,ts}"
+  - "**/pages/**/*.{tsx,ts}"
+  - "next.config.*"
+  - "**/middleware.ts"
+alwaysApply: false
+---
+
+# Next.js / React — Expert Skill
+
+You are a senior Next.js engineer. Apply App Router patterns by default. Use Pages Router only if the project is explicitly on it.
+
+---
+
+## Core Conventions
+
+### TypeScript First
+- All files: `.tsx` for components, `.ts` for logic
+- No `any` — use `unknown` + narrowing or proper types
+- Export types alongside components: `export type { Props }`
+- Use `satisfies` operator for config objects
+- **Next.js 15+**: `params` and `searchParams` are now `Promise<...>` — always `await` them
+
+### cn() Setup (required — referenced throughout)
+```bash
+npm install clsx tailwind-merge
+```
+```typescript
+// lib/utils.ts
+import { clsx, type ClassValue } from 'clsx';
+import { twMerge } from 'tailwind-merge';
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
+```
+
+### Environment Variables — Always Validate
+```bash
+npm install @t3-oss/env-nextjs zod
+```
+```typescript
+// env.ts (project root)
+import { createEnv } from '@t3-oss/env-nextjs';
+import { z } from 'zod';
+
+export const env = createEnv({
+  server: {
+    DATABASE_URL:            z.string().url(),
+    SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
+    OPENAI_API_KEY:          z.string().min(1),
+  },
+  client: {
+    NEXT_PUBLIC_SUPABASE_URL:      z.string().url(),
+    NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().min(1),
+    NEXT_PUBLIC_APP_URL:           z.string().url(),
+  },
+  runtimeEnv: {
+    DATABASE_URL:                  process.env.DATABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY:     process.env.SUPABASE_SERVICE_ROLE_KEY,
+    OPENAI_API_KEY:                process.env.OPENAI_API_KEY,
+    NEXT_PUBLIC_SUPABASE_URL:      process.env.NEXT_PUBLIC_SUPABASE_URL,
+    NEXT_PUBLIC_SUPABASE_ANON_KEY: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    NEXT_PUBLIC_APP_URL:           process.env.NEXT_PUBLIC_APP_URL,
+  },
+});
+// Import env.ts in next.config.ts to validate at build time
+```
+
+### File Naming
+```
+app/
+├── (auth)/               # Route groups — no URL segment
+│   ├── login/page.tsx
+│   └── register/page.tsx
+├── dashboard/
+│   ├── layout.tsx        # Nested layout
+│   ├── page.tsx          # Server component by default
+│   ├── loading.tsx       # Suspense boundary
+│   ├── error.tsx         # Error boundary ('use client')
+│   └── not-found.tsx
+├── api/
+│   └── [resource]/
+│       └── route.ts      # Route handlers
+components/
+├── ui/                   # Dumb, reusable primitives
+├── features/             # Feature-scoped, may have data
+└── layouts/              # Page-level layout components
+lib/
+├── actions/              # Server actions
+├── data/                 # Data fetching functions
+├── hooks/                # Client-side hooks
+├── utils/                # Pure functions
+└── types/                # Shared types
+```
+
+---
+
+## Server vs Client Components
+
+### Decision Rule
+```
+Is there interactivity, browser APIs, useState, useEffect, event handlers?
+  YES → 'use client'
+  NO  → Server Component (default, no directive needed)
+```
+
+### Server Component Scaffold
+```tsx
+// app/dashboard/[id]/page.tsx — Server Component (no directive)
+// Next.js 15+: params and searchParams are Promises — always await
+import { Suspense } from 'react';
+import { getUserData } from '@/lib/data/user';
+import { UserCard } from '@/components/features/UserCard';
+import { UserCardSkeleton } from '@/components/ui/skeletons';
+
+interface PageProps {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
+}
+
+export async function generateMetadata({ params }: PageProps) {
+  const { id } = await params;
+  return { title: `Dashboard — ${id}` };
+}
+
+export default async function DashboardPage({ params }: PageProps) {
+  const { id } = await params;
+  const data = await getUserData(id);
+
+  return (
+    <main className="container mx-auto py-8">
+      <Suspense fallback={<UserCardSkeleton />}>
+        <UserCard user={data} />
+      </Suspense>
+    </main>
+  );
+}
+```
+
+### Client Component Scaffold
+```tsx
+// components/features/SearchBar.tsx
+'use client';
+
+import { useState, useTransition } from 'react';
+import { useRouter } from 'next/navigation';
+
+interface SearchBarProps {
+  placeholder?: string;
+  defaultValue?: string;
+}
+
+export function SearchBar({ placeholder = 'Search...', defaultValue = '' }: SearchBarProps) {
+  const [value, setValue] = useState(defaultValue);
+  const [isPending, startTransition] = useTransition();
+  const router = useRouter();
+
+  function handleSearch(term: string) {
+    startTransition(() => {
+      const params = new URLSearchParams(window.location.search);
+      if (term) {
+        params.set('q', term);
+      } else {
+        params.delete('q');
+      }
+      router.replace(`?${params.toString()}`);
+    });
+  }
+
+  return (
+    <div className="relative">
+      <input
+        type="search"
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => {
+          setValue(e.target.value);
+          handleSearch(e.target.value);
+        }}
+        className="w-full rounded-md border px-4 py-2"
+        aria-label={placeholder}
+      />
+      {isPending && (
+        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">
+          Searching…
+        </span>
+      )}
+    </div>
+  );
+}
+```
+
+---
+
+## Data Fetching
+
+### Data Layer Functions (Server)
+```typescript
+// lib/data/posts.ts
+import { cache } from 'react';
+import { db } from '@/lib/db';
+
+// cache() deduplicates requests within a single render pass
+export const getPosts = cache(async (userId: string) => {
+  return db.post.findMany({
+    where: { userId },
+    orderBy: { createdAt: 'desc' },
+    select: {
+      id: true,
+      title: true,
+      slug: true,
+      createdAt: true,
+    },
+  });
+});
+
+export async function getPostBySlug(slug: string) {
+  const post = await db.post.findUnique({ where: { slug } });
+  if (!post) return null;
+  return post;
+}
+```
+
+### Server Actions
+```typescript
+// lib/actions/posts.ts
+'use server';
+
+import { revalidatePath } from 'next/cache';
+import { redirect } from 'next/navigation';
+import { z } from 'zod';
+import { auth } from '@/lib/auth';
+
+const CreatePostSchema = z.object({
+  title: z.string().min(1).max(255),
+  content: z.string().min(1),
+  published: z.boolean().default(false),
+});
+
+export type CreatePostState = {
+  errors?: Partial<Record<keyof z.infer<typeof CreatePostSchema>, string[]>>;
+  message?: string;
+};
+
+export async function createPost(
+  prevState: CreatePostState,
+  formData: FormData
+): Promise<CreatePostState> {
+  const session = await auth();
+  if (!session) redirect('/login');
+
+  const validated = CreatePostSchema.safeParse({
+    title: formData.get('title'),
+    content: formData.get('content'),
+    published: formData.get('published') === 'true',
+  });
+
+  if (!validated.success) {
+    return { errors: validated.error.flatten().fieldErrors };
+  }
+
+  try {
+    await db.post.create({
+      data: { ...validated.data, userId: session.user.id },
+    });
+  } catch {
+    return { message: 'Failed to create post. Please try again.' };
+  }
+
+  revalidatePath('/dashboard/posts');
+  redirect('/dashboard/posts');
+}
+```
+
+### Route Handler Scaffold
+```typescript
+// app/api/posts/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { z } from 'zod';
+import { auth } from '@/lib/auth';
+
+const CreateSchema = z.object({
+  title: z.string().min(1),
+  content: z.string().min(1),
+});
+
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const page = Number(searchParams.get('page') ?? 1);
+
+  const posts = await getPosts({ page });
+  return NextResponse.json({ posts });
+}
+
+export async function POST(request: NextRequest) {
+  const session = await auth();
+  if (!session) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const body = await request.json();
+  const validated = CreateSchema.safeParse(body);
+
+  if (!validated.success) {
+    return NextResponse.json(
+      { error: 'Invalid input', details: validated.error.flatten() },
+      { status: 400 }
+    );
+  }
+
+  const post = await createPost({ ...validated.data, userId: session.user.id });
+  return NextResponse.json({ post }, { status: 201 });
+}
+```
+
+---
+
+## Component Patterns
+
+### Compound Components
+```tsx
+// components/ui/Card.tsx
+interface CardProps { children: React.ReactNode; className?: string; }
+interface CardHeaderProps { children: React.ReactNode; }
+interface CardBodyProps { children: React.ReactNode; }
+
+function Card({ children, className }: CardProps) {
+  return <div className={cn('rounded-xl border bg-card p-0 shadow-sm', className)}>{children}</div>;
+}
+
+Card.Header = function CardHeader({ children }: CardHeaderProps) {
+  return <div className="border-b px-6 py-4 font-semibold">{children}</div>;
+};
+
+Card.Body = function CardBody({ children }: CardBodyProps) {
+  return <div className="px-6 py-4">{children}</div>;
+};
+
+export { Card };
+
+// Usage:
+// <Card><Card.Header>Title</Card.Header><Card.Body>Content</Card.Body></Card>
+```
+
+### Error Boundary
+```tsx
+// app/dashboard/error.tsx
+'use client';
+
+import { useEffect } from 'react';
+
+interface ErrorProps {
+  error: Error & { digest?: string };
+  reset: () => void;
+}
+
+export default function Error({ error, reset }: ErrorProps) {
+  useEffect(() => {
+    console.error(error);
+    // Report to error tracking: Sentry.captureException(error)
+  }, [error]);
+
+  return (
+    <div className="flex flex-col items-center gap-4 py-16">
+      <h2 className="text-xl font-semibold">Something went wrong</h2>
+      <p className="text-muted-foreground text-sm">{error.message}</p>
+      <button
+        onClick={reset}
+        className="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground"
+      >
+        Try again
+      </button>
+    </div>
+  );
+}
+```
+
+---
+
+## Middleware
+
+```typescript
+// middleware.ts — runs on every matched request before rendering
+import { NextResponse, type NextRequest } from 'next/server';
+
+export function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  // Auth guard — redirect unauthenticated users
+  const token = request.cookies.get('session')?.value;
+  if (!token && pathname.startsWith('/dashboard')) {
+    return NextResponse.redirect(new URL('/login', request.url));
+  }
+
+  // Add security headers to all responses
+  const response = NextResponse.next();
+  response.headers.set('X-Frame-Options', 'DENY');
+  response.headers.set('X-Content-Type-Options', 'nosniff');
+  return response;
+}
+
+export const config = {
+  // Exclude static assets and API routes from middleware
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|api/).*)'],
+};
+```
+
+---
+
+## Parallel Routes & Intercepting Routes
+
+```
+app/
+├── @modal/           # Parallel route slot — renders alongside the page
+│   └── photo/[id]/
+│       └── page.tsx  # Modal content
+├── layout.tsx        # Receives { children, modal } props
+└── photos/
+    └── page.tsx      # Photo grid
+
+# layout.tsx receives named slots as props:
+export default function Layout({ children, modal }: { children: React.ReactNode; modal: React.ReactNode }) {
+  return (
+    <>
+      {children}
+      {modal}   {/* renders the modal overlay */}
+    </>
+  );
+}
+```
+
+```
+# Intercepting routes — show a modal on navigate, full page on direct URL
+app/
+├── photos/
+│   ├── [id]/
+│   │   └── page.tsx          # Full page (direct URL / refresh)
+│   └── (.)photos/[id]/       # (.) = same level interception
+│       └── page.tsx          # Modal view (client-side nav)
+```
+
+---
+
+## Performance
+
+### Image Optimization
+```tsx
+import Image from 'next/image';
+
+// Always use next/image — never <img>
+<Image
+  src={src}
+  alt={alt}
+  width={800}
+  height={600}
+  priority={isAboveFold}  // only for LCP images
+  placeholder="blur"
+  blurDataURL={blurUrl}
+  className="object-cover"
+/>
+```
+
+### Dynamic Imports
+```tsx
+import dynamic from 'next/dynamic';
+
+// Heavy client components — load lazily
+const HeavyChart = dynamic(() => import('@/components/features/HeavyChart'), {
+  ssr: false,
+  loading: () => <ChartSkeleton />,
+});
+```
+
+---
+
+## Rules
+
+- **Default to Server Components** — only add `'use client'` when necessary
+- **Never** `fetch()` in a Client Component on mount — lift data fetching to Server Components or use a dedicated data layer
+- **Always** validate Server Action inputs with Zod
+- **Always** handle loading and error states with `loading.tsx` / `error.tsx`
+- **Never** use `getServerSideProps` or `getStaticProps` in App Router
+- **Always** use `next/image` and `next/link` — never raw `<img>` or `<a>`
+- **Prefer** `useTransition` over loading state booleans for navigations
+- Co-locate component types with the component file — no separate `/types` folder for component props
+- Use `cn()` (clsx + tailwind-merge) for all className composition
+- **Next.js 15+**: always `await params` and `searchParams` — they are Promises
+- **Always** validate env vars with `@t3-oss/env-nextjs` — never access `process.env` directly in app code
+- Use middleware for auth guards and security headers — not page-level redirects

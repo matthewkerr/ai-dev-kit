@@ -1,0 +1,603 @@
+---
+description: Expert guidance for building Node.js autonomous agents, multi-agent systems, LLM orchestration pipelines, background workers, and agentic tools. Use this skill when building or modifying agents, schedulers, LLM pipelines, tool-use systems, MCP servers, streaming LLM responses, memory layers, polling loops, or any autonomous process that makes decisions or takes actions without direct human input.
+globs:
+  - "**/*agent*.{ts,js}"
+  - "**/*worker*.{ts,js}"
+  - "**/*pipeline*.{ts,js}"
+  - "**/*scheduler*.{ts,js}"
+  - "**/agents/**/*.{ts,js,mts}"
+  - "**/workers/**/*.{ts,js,mts}"
+  - "**/mcp/**/*.{ts,js,mts}"
+alwaysApply: false
+---
+
+# Node.js Agents & Autonomous Systems
+
+You are an expert in autonomous agent architecture, LLM orchestration, and production-grade background systems in Node.js/TypeScript. Apply these principles rigorously.
+
+---
+
+## Core Architecture Principles
+
+### Agent Anatomy
+Every agent has four concerns — keep them separate:
+
+1. **Perception** — ingesting inputs (API, DB, filesystem, events)
+2. **Reasoning** — LLM calls, rule evaluation, decision logic
+3. **Action** — side effects (HTTP calls, DB writes, notifications)
+4. **Memory** — state persistence (short-term: context window, long-term: DB/vector store)
+
+Never mix these in a single function. Each should be independently testable.
+
+### Agent Loop Pattern
+```typescript
+// Base agent loop — use this as the foundation for all agents
+class AgentLoop {
+  private running = false;
+  private iteration = 0;
+
+  async start() {
+    this.running = true;
+    while (this.running) {
+      try {
+        const context = await this.perceive();
+        const decision = await this.reason(context);
+        const result = await this.act(decision);
+        await this.remember(context, decision, result);
+        await this.onCycleComplete(result);
+      } catch (err) {
+        await this.onError(err);
+      }
+      this.iteration++;
+      await this.sleep();
+    }
+  }
+
+  protected async perceive(): Promise<AgentContext> { throw new Error('Not implemented'); }
+  protected async reason(ctx: AgentContext): Promise<Decision> { throw new Error('Not implemented'); }
+  protected async act(decision: Decision): Promise<ActionResult> { throw new Error('Not implemented'); }
+  protected async remember(ctx: AgentContext, decision: Decision, result: ActionResult): Promise<void> {}
+  protected async onCycleComplete(result: ActionResult): Promise<void> {}
+  protected async onError(err: unknown): Promise<void> { console.error('[agent] cycle error:', err); }
+  protected async sleep(): Promise<void> { await new Promise(r => setTimeout(r, this.intervalMs)); }
+
+  stop() { this.running = false; }
+}
+```
+
+---
+
+## LLM Orchestration
+
+### Model Routing
+Define a `models.config.ts` — never hardcode model strings inline:
+```typescript
+export const MODELS = {
+  FAST:        'gpt-4o-mini',         // high-volume, low-latency
+  REASONING:   'gpt-4o',              // complex decisions
+  CHEAP:       'gpt-4o-mini',         // background tasks
+  LOCAL:       'llama3.2',            // offline / sensitive data
+  MULTIMODAL:  'gpt-4o',             // vision/audio
+} as const;
+
+export type ModelTier = keyof typeof MODELS;
+
+export function getModel(tier: ModelTier): string {
+  return MODELS[tier];
+}
+```
+
+### Structured LLM Calls
+Always use structured output with Zod validation. Never parse LLM text manually:
+```typescript
+import { z } from 'zod';
+
+const DecisionSchema = z.object({
+  action: z.enum(['proceed', 'wait', 'abort', 'escalate']),
+  reasoning: z.string(),
+  confidence: z.number().min(0).max(1),
+  nextStepHint: z.string().optional(),
+});
+
+type Decision = z.infer<typeof DecisionSchema>;
+
+async function reason(context: string): Promise<Decision> {
+  const response = await openai.chat.completions.create({
+    model: getModel('REASONING'),
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: context },
+    ],
+    response_format: { type: 'json_object' },
+    temperature: 0.2,
+  });
+
+  const raw = JSON.parse(response.choices[0].message.content ?? '{}');
+  return DecisionSchema.parse(raw); // throws on invalid — let it bubble
+}
+```
+
+### Prompt Architecture
+```typescript
+// prompts/index.ts — keep all prompts co-located and versioned
+export const prompts = {
+  system: (agentName: string, capabilities: string[]) => `
+You are ${agentName}, an autonomous agent with the following capabilities:
+${capabilities.map(c => `- ${c}`).join('\n')}
+
+You operate in a loop. Each cycle you receive context and must return a structured decision.
+Be concise. Be decisive. Prefer action over inaction when confidence > 0.7.
+  `.trim(),
+
+  reason: (context: AgentContext) => `
+Current state:
+${JSON.stringify(context, null, 2)}
+
+Based on this context, decide what action to take. Return JSON matching the Decision schema.
+  `.trim(),
+};
+```
+
+---
+
+## Memory Patterns
+
+### Short-Term: Sliding Window Context
+```typescript
+class ContextWindow {
+  private messages: Message[] = [];
+  private readonly maxTokens: number;
+
+  constructor(maxTokens = 8000) {
+    this.maxTokens = maxTokens;
+  }
+
+  push(message: Message) {
+    this.messages.push(message);
+    this.prune();
+  }
+
+  private prune() {
+    // Rough token estimate — replace with tiktoken in production
+    while (this.estimatedTokens() > this.maxTokens && this.messages.length > 1) {
+      this.messages.shift();
+    }
+  }
+
+  private estimatedTokens(): number {
+    return this.messages.reduce((acc, m) => acc + m.content.length / 4, 0);
+  }
+
+  toArray(): Message[] { return [...this.messages]; }
+}
+```
+
+### Long-Term: Persistent Memory Record
+```typescript
+// Always write memory records with these fields
+interface MemoryRecord {
+  id: string;
+  agentId: string;
+  sessionId: string;
+  iteration: number;
+  context: AgentContext;
+  decision: Decision;
+  outcome: 'success' | 'failure' | 'partial';
+  durationMs: number;
+  createdAt: Date;
+  tags: string[];          // for semantic search
+  embedding?: number[];    // optional: pgvector
+}
+```
+
+---
+
+## Tool Use / Function Calling
+
+### Tool Definition Pattern
+```typescript
+interface AgentTool<TInput, TOutput> {
+  name: string;
+  description: string;
+  schema: z.ZodType<TInput>;
+  execute: (input: TInput) => Promise<TOutput>;
+}
+
+// Example tool
+const fetchUrlTool: AgentTool<{ url: string }, { content: string; statusCode: number }> = {
+  name: 'fetch_url',
+  description: 'Fetches the text content of a URL',
+  schema: z.object({ url: z.string().url() }),
+  execute: async ({ url }) => {
+    const res = await fetch(url);
+    return { content: await res.text(), statusCode: res.status };
+  },
+};
+
+// Tool registry
+class ToolRegistry {
+  private tools = new Map<string, AgentTool<any, any>>();
+
+  register(tool: AgentTool<any, any>) {
+    this.tools.set(tool.name, tool);
+  }
+
+  toOpenAIFormat() {
+    // zod-to-json-schema: npm install zod-to-json-schema
+    const { zodToJsonSchema } = require('zod-to-json-schema');
+    return [...this.tools.values()].map(t => ({
+      type: 'function' as const,
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: zodToJsonSchema(t.schema),
+      },
+    }));
+  }
+
+  async execute(name: string, args: unknown) {
+    const tool = this.tools.get(name);
+    if (!tool) throw new Error(`Unknown tool: ${name}`);
+    return tool.execute(tool.schema.parse(args));
+  }
+}
+```
+
+---
+
+## Resilience & Production Patterns
+
+### Retry with Exponential Backoff
+```typescript
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  opts: { maxAttempts?: number; baseDelayMs?: number; label?: string } = {}
+): Promise<T> {
+  const { maxAttempts = 3, baseDelayMs = 1000, label = 'operation' } = opts;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt === maxAttempts) break;
+      const delay = baseDelayMs * Math.pow(2, attempt - 1);
+      console.warn(`[retry] ${label} attempt ${attempt} failed, retrying in ${delay}ms`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+
+  throw lastError;
+}
+```
+
+### Circuit Breaker
+```typescript
+class CircuitBreaker {
+  private failures = 0;
+  private state: 'closed' | 'open' | 'half-open' = 'closed';
+  private lastFailureAt?: number;
+
+  constructor(
+    private readonly threshold = 5,
+    private readonly resetMs = 60_000
+  ) {}
+
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === 'open') {
+      if (Date.now() - (this.lastFailureAt ?? 0) > this.resetMs) {
+        this.state = 'half-open';
+      } else {
+        throw new Error('Circuit breaker open');
+      }
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      throw err;
+    }
+  }
+
+  private onSuccess() {
+    this.failures = 0;
+    this.state = 'closed';
+  }
+
+  private onFailure() {
+    this.failures++;
+    this.lastFailureAt = Date.now();
+    if (this.failures >= this.threshold) this.state = 'open';
+  }
+}
+```
+
+### Graceful Shutdown
+```typescript
+// Always implement graceful shutdown in agent entrypoints
+const agent = new MyAgent();
+
+process.on('SIGTERM', async () => {
+  console.log('[agent] SIGTERM received, shutting down gracefully...');
+  agent.stop();
+  await agent.flush(); // persist any buffered state
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  agent.stop();
+  process.exit(0);
+});
+```
+
+---
+
+## Observability
+
+### Structured Logging
+```typescript
+// Use a consistent log format — never console.log raw strings in agents
+const log = {
+  info:  (msg: string, meta?: object) => console.log(JSON.stringify({ level: 'info',  msg, ...meta, ts: new Date().toISOString() })),
+  warn:  (msg: string, meta?: object) => console.log(JSON.stringify({ level: 'warn',  msg, ...meta, ts: new Date().toISOString() })),
+  error: (msg: string, meta?: object) => console.log(JSON.stringify({ level: 'error', msg, ...meta, ts: new Date().toISOString() })),
+  debug: (msg: string, meta?: object) => {
+    if (process.env.DEBUG) console.log(JSON.stringify({ level: 'debug', msg, ...meta, ts: new Date().toISOString() }));
+  },
+};
+
+// Usage inside agent cycles:
+log.info('cycle complete', { iteration: this.iteration, durationMs, outcome: result.outcome });
+```
+
+### Cycle Metrics
+Track these on every cycle — persist or emit to a metrics system:
+```typescript
+interface CycleMetrics {
+  agentId: string;
+  iteration: number;
+  durationMs: number;
+  llmCallCount: number;
+  toolCallCount: number;
+  tokensUsed: number;
+  outcome: 'success' | 'failure' | 'skipped';
+  errorType?: string;
+}
+```
+
+---
+
+## Streaming LLM Responses
+
+Never block on full completion when streaming is available — stream for UX, buffer for tool use:
+
+```typescript
+// Stream text responses to a client (SSE / ReadableStream)
+async function streamReason(context: string): Promise<ReadableStream> {
+  const stream = await openai.chat.completions.create({
+    model: getModel('FAST'),
+    messages: [{ role: 'user', content: context }],
+    stream: true,
+  });
+
+  return new ReadableStream({
+    async start(controller) {
+      for await (const chunk of stream) {
+        const delta = chunk.choices[0]?.delta?.content ?? '';
+        if (delta) controller.enqueue(new TextEncoder().encode(delta));
+      }
+      controller.close();
+    },
+  });
+}
+
+// Stream + collect full text when you need the result (tool calls, decisions)
+async function streamAndCollect(context: string): Promise<string> {
+  const stream = await openai.chat.completions.create({
+    model: getModel('REASONING'),
+    messages: [{ role: 'user', content: context }],
+    stream: true,
+  });
+
+  let full = '';
+  for await (const chunk of stream) {
+    full += chunk.choices[0]?.delta?.content ?? '';
+  }
+  return full;
+}
+```
+
+---
+
+## Multi-Agent Orchestration
+
+### Orchestrator / Subagent Pattern
+```typescript
+// Orchestrators decompose tasks and delegate to specialist subagents.
+// Subagents never know about each other — only the orchestrator coordinates.
+
+interface SubagentTask {
+  agentId: string;
+  input: unknown;
+  timeoutMs?: number;
+}
+
+interface SubagentResult {
+  agentId: string;
+  output: unknown;
+  durationMs: number;
+  success: boolean;
+  error?: string;
+}
+
+class OrchestratorAgent extends AgentLoop {
+  private subagents = new Map<string, AgentLoop>();
+
+  register(id: string, agent: AgentLoop) {
+    this.subagents.set(id, agent);
+  }
+
+  // Run subagents in parallel; collect results
+  async dispatch(tasks: SubagentTask[]): Promise<SubagentResult[]> {
+    return Promise.all(tasks.map(async (task) => {
+      const agent = this.subagents.get(task.agentId);
+      if (!agent) return { agentId: task.agentId, output: null, durationMs: 0, success: false, error: 'Agent not found' };
+
+      const start = Date.now();
+      try {
+        const output = await Promise.race([
+          agent.runOnce(task.input),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), task.timeoutMs ?? 30_000)),
+        ]);
+        return { agentId: task.agentId, output, durationMs: Date.now() - start, success: true };
+      } catch (err) {
+        return { agentId: task.agentId, output: null, durationMs: Date.now() - start, success: false, error: String(err) };
+      }
+    }));
+  }
+}
+```
+
+### Agent Handoff Protocol
+```typescript
+// Agents communicate via typed handoff messages — never shared mutable state
+interface HandoffMessage<T = unknown> {
+  fromAgent: string;
+  toAgent: string;
+  taskId: string;
+  payload: T;
+  priority: 'low' | 'normal' | 'high';
+  createdAt: Date;
+  expiresAt?: Date;
+}
+
+// Use a queue (Redis, Supabase, or in-process EventEmitter) as the handoff bus
+// Never call another agent's methods directly from a subagent
+```
+
+---
+
+## MCP (Model Context Protocol)
+
+MCP is the standard protocol for exposing tools to LLMs. Build MCP servers for any capability you want agents to call:
+
+```typescript
+// mcp/server.ts — minimal MCP server using @modelcontextprotocol/sdk
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { z } from 'zod';
+
+const server = new Server(
+  { name: 'my-agent-tools', version: '1.0.0' },
+  { capabilities: { tools: {} } }
+);
+
+// Register available tools
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: 'fetch_url',
+      description: 'Fetches the text content of a URL',
+      inputSchema: {
+        type: 'object',
+        properties: { url: { type: 'string', format: 'uri' } },
+        required: ['url'],
+      },
+    },
+  ],
+}));
+
+// Handle tool calls
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  if (name === 'fetch_url') {
+    const { url } = z.object({ url: z.string().url() }).parse(args);
+    const res = await fetch(url);
+    const text = await res.text();
+    return { content: [{ type: 'text', text: text.slice(0, 10_000) }] };
+  }
+
+  throw new Error(`Unknown tool: ${name}`);
+});
+
+// Start the server (stdio transport for local tools)
+const transport = new StdioServerTransport();
+await server.connect(transport);
+```
+
+```bash
+# Install: npm install @modelcontextprotocol/sdk
+# Run as a subprocess that your agent spawns, or register with Claude Desktop / Cursor
+```
+
+---
+
+## File Structure
+
+```
+src/
+├── agents/
+│   ├── base/
+│   │   ├── AgentLoop.ts         # Abstract base class
+│   │   ├── OrchestratorAgent.ts # Multi-agent orchestrator
+│   │   ├── ToolRegistry.ts
+│   │   └── ContextWindow.ts
+│   └── [agent-name]/
+│       ├── index.ts             # Entrypoint + graceful shutdown
+│       ├── agent.ts             # Agent class (extends AgentLoop)
+│       ├── prompts.ts           # All prompts for this agent
+│       ├── tools.ts             # Agent-specific tools
+│       └── types.ts             # Input/output/state types
+├── mcp/
+│   └── server.ts                # MCP tool server
+├── lib/
+│   ├── models.config.ts         # Model routing
+│   ├── retry.ts                 # withRetry()
+│   ├── circuitBreaker.ts        # CircuitBreaker class
+│   └── log.ts                   # Structured logger
+└── workers/                     # PM2 entrypoints
+    └── [agent-name].ts
+```
+
+### PM2 Ecosystem Config
+```javascript
+// ecosystem.config.js — always include this for production agents
+module.exports = {
+  apps: [
+    {
+      name: 'my-agent',
+      script: 'dist/workers/my-agent.js',
+      instances: 1,               // agents are stateful — single instance
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '512M',
+      env: { NODE_ENV: 'production' },
+      error_file: 'logs/agent-error.log',
+      out_file: 'logs/agent-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+    },
+  ],
+};
+```
+
+---
+
+## Rules
+
+- **Never** put LLM calls directly in a route handler — always delegate to an agent or service class
+- **Always** validate LLM output with Zod before using it
+- **Always** implement retry + graceful shutdown in production agents
+- **Never** hardcode model names — use `models.config.ts`
+- **Always** log structured JSON, never raw strings
+- **Prefer** class-based agents over ad-hoc async functions for anything that runs in a loop
+- **Always** separate tool definitions from agent logic
+- **Orchestrators coordinate, subagents execute** — subagents never call each other directly
+- **Use MCP** for any tool set you want to share across agents or expose to Claude/Cursor
+- **Stream when possible** — never block on full completion for user-facing output
+- Use `pm2` with `ecosystem.config.js` for all production agent processes

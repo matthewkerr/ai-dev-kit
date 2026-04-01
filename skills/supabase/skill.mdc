@@ -1,0 +1,550 @@
+---
+description: Expert guidance for Supabase — schema design, Row Level Security (RLS), Edge Functions, real-time subscriptions, auth patterns, storage, and TypeScript client usage. Use when designing tables, writing RLS policies, building edge functions, handling auth, or doing anything with the Supabase platform.
+globs:
+  - "**/supabase/**/*"
+  - "**/*.sql"
+  - "**/migrations/**/*"
+  - "**/functions/**/*"
+  - "supabase/config.toml"
+alwaysApply: false
+---
+
+# Supabase — Expert Skill
+
+You are an expert in Supabase, PostgreSQL, and production-grade backend-as-a-service patterns. Apply these conventions rigorously.
+
+---
+
+## Schema Design Principles
+
+### Table Conventions
+```sql
+-- Always include these columns on every user-facing table
+CREATE TABLE posts (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  -- domain columns
+  title       TEXT NOT NULL CHECK (char_length(title) BETWEEN 1 AND 255),
+  content     TEXT NOT NULL,
+  published   BOOLEAN NOT NULL DEFAULT false,
+  slug        TEXT NOT NULL UNIQUE CHECK (slug ~ '^[a-z0-9-]+$')
+);
+
+-- Always create an updated_at trigger
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER posts_updated_at
+  BEFORE UPDATE ON posts
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- Always index foreign keys and common query columns
+CREATE INDEX idx_posts_user_id   ON posts(user_id);
+CREATE INDEX idx_posts_created_at ON posts(created_at DESC);
+CREATE INDEX idx_posts_slug       ON posts(slug);
+```
+
+### Naming Conventions
+- Tables: `snake_case`, plural (`posts`, `user_profiles`)
+- Columns: `snake_case`
+- Foreign keys: `{table_singular}_id` (`user_id`, `post_id`)
+- Indexes: `idx_{table}_{column}` 
+- Functions: `snake_case` verbs (`get_user_stats`, `update_updated_at`)
+- Junction tables: `{table_a}_{table_b}` alphabetical (`post_tags`)
+
+---
+
+## Row Level Security (RLS)
+
+### Always Enable RLS First
+```sql
+ALTER TABLE posts ENABLE ROW LEVEL SECURITY;
+-- Enable on EVERY table — no exceptions
+```
+
+### Policy Patterns
+```sql
+-- Pattern 1: User owns their own rows (most common)
+CREATE POLICY "users can view own posts"
+  ON posts FOR SELECT
+  USING (auth.uid() = user_id);
+
+CREATE POLICY "users can insert own posts"
+  ON posts FOR INSERT
+  WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "users can update own posts"
+  ON posts FOR UPDATE
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "users can delete own posts"
+  ON posts FOR DELETE
+  USING (auth.uid() = user_id);
+
+-- Pattern 2: Public read, authenticated write
+CREATE POLICY "public can view published posts"
+  ON posts FOR SELECT
+  USING (published = true);
+
+CREATE POLICY "authors can manage own posts"
+  ON posts FOR ALL
+  USING (auth.uid() = user_id);
+
+-- Pattern 3: Role-based access via profiles table
+CREATE POLICY "admins can do everything"
+  ON posts FOR ALL
+  USING (
+    EXISTS (
+      SELECT 1 FROM user_profiles
+      WHERE user_profiles.user_id = auth.uid()
+        AND user_profiles.role = 'admin'
+    )
+  );
+
+-- Pattern 4: Service role bypass (for Edge Functions / server)
+-- Service role key bypasses RLS — never expose it client-side
+```
+
+### RLS Anti-Patterns to Avoid
+```sql
+-- NEVER: disabling RLS for convenience
+ALTER TABLE posts DISABLE ROW LEVEL SECURITY; -- NEVER do this in production
+
+-- NEVER: overly permissive catch-all
+CREATE POLICY "allow all" ON posts FOR ALL USING (true); -- NEVER
+
+-- AVOID: N+1 in policies — use EXISTS not IN
+-- BAD:
+USING (user_id IN (SELECT id FROM user_profiles WHERE role = 'admin'))
+-- GOOD:
+USING (EXISTS (SELECT 1 FROM user_profiles WHERE user_id = auth.uid() AND role = 'admin'))
+```
+
+---
+
+## TypeScript Client
+
+### Type Generation (always use generated types)
+```bash
+supabase gen types typescript --project-id your-project-id > src/lib/database.types.ts
+```
+
+### Typed Client Setup
+```typescript
+// lib/supabase/client.ts — browser client
+import { createBrowserClient } from '@supabase/ssr';
+import type { Database } from '@/lib/database.types';
+
+export function createClient() {
+  return createBrowserClient<Database>(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  );
+}
+
+// lib/supabase/server.ts — server client (Next.js App Router)
+import { createServerClient } from '@supabase/ssr';
+import { cookies } from 'next/headers';
+import type { Database } from '@/lib/database.types';
+
+export async function createServerSupabaseClient() {
+  const cookieStore = await cookies();
+  return createServerClient<Database>(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll: () => cookieStore.getAll(),
+        setAll: (cookiesToSet) => {
+          cookiesToSet.forEach(({ name, value, options }) =>
+            cookieStore.set(name, value, options)
+          );
+        },
+      },
+    }
+  );
+}
+```
+
+### Query Patterns
+```typescript
+// Always destructure { data, error } — never assume success
+const { data: posts, error } = await supabase
+  .from('posts')
+  .select(`
+    id,
+    title,
+    slug,
+    created_at,
+    user_profiles ( display_name, avatar_url )
+  `)
+  .eq('published', true)
+  .order('created_at', { ascending: false })
+  .range(0, 9);  // pagination
+
+if (error) throw new Error(`Failed to fetch posts: ${error.message}`);
+
+// Type-safe upsert
+const { error: upsertError } = await supabase
+  .from('posts')
+  .upsert({
+    id: existingId ?? undefined,
+    user_id: session.user.id,
+    title,
+    content,
+    slug,
+  });
+```
+
+---
+
+## Edge Functions
+
+### Edge Function Scaffold
+```typescript
+// supabase/functions/process-webhook/index.ts
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+
+serve(async (req: Request) => {
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    // Service role client — bypasses RLS for server-side ops
+    const supabase = createClient(
+      Deno.env.get('SUPABASE_URL')!,
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+    );
+
+    const body = await req.json();
+
+    // Verify webhook signature here if applicable
+    // ...
+
+    const { error } = await supabase.from('events').insert({
+      type: body.type,
+      payload: body,
+    });
+
+    if (error) throw error;
+
+    return new Response(
+      JSON.stringify({ success: true }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 200 }
+    );
+  } catch (err) {
+    console.error(err);
+    return new Response(
+      JSON.stringify({ error: 'Internal server error' }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 500 }
+    );
+  }
+});
+```
+
+---
+
+## Realtime
+
+### Subscription Pattern
+```typescript
+// Always clean up subscriptions
+useEffect(() => {
+  const channel = supabase
+    .channel('posts-changes')
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'posts',
+        filter: `user_id=eq.${userId}`,
+      },
+      (payload) => {
+        setPosts(prev => [payload.new as Post, ...prev]);
+      }
+    )
+    .subscribe();
+
+  return () => { supabase.removeChannel(channel); };
+}, [userId]);
+```
+
+---
+
+## Auth Patterns
+
+### Session Handling (Next.js)
+```typescript
+// middleware.ts — protect routes server-side
+import { createServerClient } from '@supabase/ssr';
+import { NextResponse, type NextRequest } from 'next/server';
+
+export async function middleware(request: NextRequest) {
+  let supabaseResponse = NextResponse.next({ request });
+
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll: () => request.cookies.getAll(),
+        setAll: (cookiesToSet) => {
+          cookiesToSet.forEach(({ name, value, options }) =>
+            supabaseResponse.cookies.set(name, value, options)
+          );
+        },
+      },
+    }
+  );
+
+  const { data: { session } } = await supabase.auth.getSession();
+
+  if (!session && request.nextUrl.pathname.startsWith('/dashboard')) {
+    return NextResponse.redirect(new URL('/login', request.url));
+  }
+
+  return supabaseResponse;
+}
+
+export const config = {
+  matcher: ['/dashboard/:path*'],
+};
+```
+
+---
+
+## pgvector — Vector Search
+
+For RAG pipelines, semantic memory, and similarity search:
+
+```sql
+-- Enable the extension once per project
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Add an embedding column to any table
+ALTER TABLE posts ADD COLUMN embedding vector(1536);  -- 1536 for OpenAI text-embedding-3-small
+
+-- Index for fast ANN search (IVFFlat for large tables, HNSW for accuracy)
+CREATE INDEX idx_posts_embedding ON posts
+  USING hnsw (embedding vector_cosine_ops);
+
+-- Semantic similarity search
+SELECT id, title, 1 - (embedding <=> $1::vector) AS similarity
+FROM posts
+WHERE published = true
+ORDER BY embedding <=> $1::vector
+LIMIT 10;
+```
+
+```typescript
+// lib/embeddings.ts — generate and store embeddings
+import OpenAI from 'openai';
+
+const openai = new OpenAI();
+
+export async function embed(text: string): Promise<number[]> {
+  const { data } = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: text.slice(0, 8000), // hard limit
+  });
+  return data[0].embedding;
+}
+
+// Store embedding on upsert
+export async function upsertWithEmbedding(supabase: SupabaseClient, post: PostInsert) {
+  const embedding = await embed(`${post.title}\n\n${post.content}`);
+  const { error } = await supabase
+    .from('posts')
+    .upsert({ ...post, embedding: JSON.stringify(embedding) });
+  if (error) throw error;
+}
+
+// Semantic search
+export async function semanticSearch(supabase: SupabaseClient, query: string, limit = 10) {
+  const embedding = await embed(query);
+  const { data, error } = await supabase.rpc('search_posts', {
+    query_embedding: embedding,
+    match_count: limit,
+  });
+  if (error) throw error;
+  return data;
+}
+```
+
+```sql
+-- Companion RPC function for semantic search
+CREATE OR REPLACE FUNCTION search_posts(query_embedding vector, match_count int)
+RETURNS TABLE (id uuid, title text, similarity float)
+LANGUAGE sql STABLE AS $$
+  SELECT id, title, 1 - (embedding <=> query_embedding) AS similarity
+  FROM posts
+  WHERE published = true
+  ORDER BY embedding <=> query_embedding
+  LIMIT match_count;
+$$;
+```
+
+---
+
+## Storage — File Uploads
+
+```typescript
+// lib/supabase/storage.ts
+export async function uploadFile(
+  supabase: SupabaseClient,
+  bucket: string,
+  path: string,
+  file: File | Blob,
+  options?: { contentType?: string; upsert?: boolean }
+) {
+  const { data, error } = await supabase.storage
+    .from(bucket)
+    .upload(path, file, {
+      contentType: options?.contentType ?? file.type,
+      upsert: options?.upsert ?? false,
+    });
+  if (error) throw error;
+  return data;
+}
+
+// Generate a signed URL for private files (expires in 1 hour)
+export async function getSignedUrl(supabase: SupabaseClient, bucket: string, path: string) {
+  const { data, error } = await supabase.storage
+    .from(bucket)
+    .createSignedUrl(path, 3600);
+  if (error) throw error;
+  return data.signedUrl;
+}
+
+// Get a permanent public URL (public buckets only)
+export function getPublicUrl(supabase: SupabaseClient, bucket: string, path: string) {
+  const { data } = supabase.storage.from(bucket).getPublicUrl(path);
+  return data.publicUrl;
+}
+```
+
+```sql
+-- Storage RLS — restrict uploads to authenticated users, own folder
+CREATE POLICY "users can upload to own folder"
+  ON storage.objects FOR INSERT
+  WITH CHECK (
+    bucket_id = 'avatars'
+    AND auth.uid()::text = (storage.foldername(name))[1]
+  );
+
+CREATE POLICY "public can view avatars"
+  ON storage.objects FOR SELECT
+  USING (bucket_id = 'avatars');
+```
+
+---
+
+## Database Functions (RPC)
+
+Call Postgres functions directly from the client — use for complex queries, atomic operations, and anything that needs server-side logic:
+
+```sql
+-- Example: get dashboard stats atomically
+CREATE OR REPLACE FUNCTION get_user_stats(p_user_id uuid)
+RETURNS json LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE result json;
+BEGIN
+  SELECT json_build_object(
+    'postCount',    (SELECT count(*) FROM posts WHERE user_id = p_user_id),
+    'publishedCount', (SELECT count(*) FROM posts WHERE user_id = p_user_id AND published = true),
+    'totalViews',   (SELECT coalesce(sum(views), 0) FROM posts WHERE user_id = p_user_id)
+  ) INTO result;
+  RETURN result;
+END;
+$$;
+```
+
+```typescript
+// Client call
+const { data, error } = await supabase.rpc('get_user_stats', { p_user_id: userId });
+if (error) throw error;
+const stats = data as { postCount: number; publishedCount: number; totalViews: number };
+```
+
+> Use `SECURITY DEFINER` for RPCs that need to bypass RLS (runs as function owner). Use `SECURITY INVOKER` (default) when the caller's RLS should apply.
+
+---
+
+## Migration Workflow
+
+```bash
+# Start local Supabase (Docker required)
+supabase start
+
+# Create a new migration
+supabase migration new add_posts_table
+
+# Apply pending migrations locally
+supabase db push
+
+# Diff your local schema changes into a migration file
+supabase db diff -f my_changes
+
+# Reset local DB and replay all migrations from scratch
+supabase db reset
+
+# Pull remote schema to local
+supabase db pull
+
+# Push migrations to production
+supabase db push --linked
+```
+
+- **Never** hand-edit the remote DB directly — always use migrations
+- Commit migration files to git — they are the source of truth
+- Run `supabase gen types typescript` after every migration
+
+### Free-Tier Keep-Alive
+Supabase free-tier projects pause after 1 week of inactivity:
+```typescript
+// workers/supabase-keepalive.ts — run via PM2, ping every 4 days
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+async function ping() {
+  const { error } = await supabase.from('_keepalive').select('id').limit(1).maybeSingle();
+  console.log(error ? `[keepalive] error: ${error.message}` : '[keepalive] ok');
+}
+
+setInterval(ping, 4 * 24 * 60 * 60 * 1000); // every 4 days
+ping(); // immediate on startup
+```
+
+---
+
+## Rules
+
+- **Always** enable RLS on every table — no exceptions
+- **Always** use generated TypeScript types from `supabase gen types`
+- **Never** expose `SUPABASE_SERVICE_ROLE_KEY` to the client
+- **Always** destructure `{ data, error }` and handle `error`
+- **Always** clean up realtime subscriptions in `useEffect` cleanup
+- **Prefer** Supabase Auth over rolling your own — never store plaintext tokens
+- **Always** use `@supabase/ssr` for Next.js / server-rendered apps
+- Index every foreign key column and every column used in `WHERE` or `ORDER BY`
+- Use `gen_random_uuid()` for primary keys, not serial integers
+- Write RLS policies with `EXISTS` subqueries, not `IN`
+- Enable `pgvector` from day one if the project uses AI/embeddings
+- **Always** use migrations — never hand-edit the remote database schema
+- Use `SECURITY DEFINER` RPCs sparingly; prefer `SECURITY INVOKER` to respect RLS
